@@ -1,0 +1,28 @@
+# 절대 커밋 금지 - API 키 포함
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# DB 파일 (스키마만 코드로 관리, 실제 데이터/DB 파일은 제외)
+db/*.duckdb
+db/*.sqlite
+*.duckdb
+*.sqlite
+
+# 업로드/산출물
+data/
+outputs/
+*.xlsx
+!templates/*.xlsx
+
+# 캐시/로그
+.langgraph/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
