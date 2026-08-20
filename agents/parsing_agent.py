@@ -127,7 +127,10 @@ def run_parsing(file_path: str) -> dict:
 
     # Step 2~3: 행 단위 구조화 + 스키마 검증
     for idx, raw_row in df.iterrows():
-        row = {std_field: raw_row[orig_col] for std_field, orig_col in header_mapping.items()}
+        row = {
+            std_field: (None if pd.isna(raw_row[orig_col]) else raw_row[orig_col])
+            for std_field, orig_col in header_mapping.items()
+        }
         validation = validate_row_schema(row)
 
         if not validation["valid"]:

@@ -3,8 +3,10 @@ Report Agent
 
 역할: 전체 파이프라인 결과를 취합하여 최종 제공 가능 명세서(엑셀)로 재구성.
 - 경로 A(정상 검증): Meta Search(matched/inferred_confirmed) -> DB Validation -> Classification
+- 경로 D(LLM 자동 확정): Meta Search(retrieve_node -> judge_node, confidence>=0.92)
+  -> 경로 A와 동일하게 DB Validation -> Classification까지 계속 진행
 - 경로 B(담당자 거절/미매칭): Meta Search에서 unresolved로 조기 종결 (DB Validation/Classification 미경유)
-두 경로를 resolution_path 컬럼으로 구분해 하나의 산출물로 통합.
+경로 A와 D는 최종 태그 6종 체계는 동일하며 resolution_path 컬럼으로만 구분한다.
 """
 
 import os
@@ -23,6 +25,7 @@ AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
 RESOLUTION_PATH_LABEL = {
     "validated": "정상 검증",
+    "auto_confirmed": "AI 자동 확정",
     "rejected_by_human": "담당자 거절",
     "no_match": "매칭 후보 없음",
 }
@@ -41,8 +44,13 @@ TAG_LABEL = {
 def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFrame:
     rows = []
 
-    # 경로 A: 정상 검증 (Classification까지 완료)
+    # 경로 A/D: 정상 검증 (Classification까지 완료) — auto_confirmed 여부는 resolution_path로 구분
     for r in classified_results:
+        resolution_path = r.get("resolution_path") if r.get("resolution_path") in ("auto_confirmed",) else "validated"
+        evidence = r.get("evidence")
+        if resolution_path == "auto_confirmed" and r.get("llm_evidence"):
+            evidence = f"[AI 자동 확정] {r.get('llm_evidence')} | {evidence}"
+
         rows.append({
             "영문명": r.get("영문명"),
             "한글명": r.get("한글명"),
@@ -53,11 +61,11 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
             "항목설명": r.get("항목설명"),
             "소속테이블": r.get("source_table"),
             "최종태그": r.get("final_tag"),
-            "근거": r.get("evidence"),
-            "resolution_path": "validated",
+            "근거": evidence,
+            "resolution_path": resolution_path,
         })
 
-    # 경로 B: Meta Search에서 조기 종결 (unresolved - 거절 또는 미매칭)
+    # 경로 B/C: Meta Search에서 조기 종결 (unresolved - 거절 또는 미매칭)
     for r in meta_results:
         if r.get("match_status") != "unresolved":
             continue
@@ -140,6 +148,7 @@ def compute_summary_stats(merged_df: pd.DataFrame) -> dict:
         "total": len(merged_df),
         "tag_counts": tag_counts,
         "resolution_path_counts": path_counts,
+        "auto_confirm_count": path_counts.get("auto_confirmed", 0),
     }
 
 

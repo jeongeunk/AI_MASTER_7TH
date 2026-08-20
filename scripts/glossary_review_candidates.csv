@@ -1,0 +1,75 @@
+﻿term_id,canonical_term,original_synonyms,llm_suggested_synonyms,domain,linked_column_id,approve
+term_raw_telecom_dim_customer.mobile_number,mobile_number,mobile_number,"MSISDN,mobile_number,모바일폰,핸드폰번호,휴대폰번호",가입,raw_telecom_dim_customer.mobile_number,y
+term_raw_telecom_dim_customer.circle_id,circle_id,circle_id,"circle_id,권역코드,서비스권역,지역ID,지역코드",기타,raw_telecom_dim_customer.circle_id,y
+term_raw_telecom_dim_customer.first_seen_month,first_seen_month,first_seen_month,"first_seen_month,첫데이터월,첫등장월,최초관측월",가입,raw_telecom_dim_customer.first_seen_month,y
+term_raw_telecom_dim_customer.aon_at_first_seen,aon_at_first_seen,aon_at_first_seen,"aon_at_first_seen,가입기간(최초관측시),첫관측가입일수,최초관측가입기간",가입,raw_telecom_dim_customer.aon_at_first_seen,y
+term_raw_telecom_dim_customer.churn_month,churn_month,churn_month,"churn_month,이탈월,탈퇴월,해지월",가입,raw_telecom_dim_customer.churn_month,y
+term_raw_telecom_fact_call_incoming.mobile_number,mobile_number,mobile_number,"MSISDN,mobile_number,모바일폰,핸드폰번호,휴대폰번호",가입,raw_telecom_fact_call_incoming.mobile_number,y
+term_raw_telecom_fact_call_incoming.month,month,month,"month,기준월,데이터월,연월",기타,raw_telecom_fact_call_incoming.month,y
+term_raw_telecom_fact_call_incoming.aon,aon,aon,"aon,가입기간,가입일수,누적가입일수",가입,raw_telecom_fact_call_incoming.aon,y
+term_raw_telecom_fact_call_incoming.roam_ic_mou,roam_ic_mou,roam_ic_mou,"roam_ic_mou,로밍수신MOU,로밍수신통화분,로밍수신통화시간",통화,raw_telecom_fact_call_incoming.roam_ic_mou,y
+term_raw_telecom_fact_call_incoming.loc_ic_t2t_mou,loc_ic_t2t_mou,loc_ic_t2t_mou,"loc_ic_t2t_mou,로컬수신T2T통화시간,로컬수신동일사통화시간,로컬수신동일통신사MOU",통화,raw_telecom_fact_call_incoming.loc_ic_t2t_mou,y
+term_raw_telecom_fact_call_incoming.loc_ic_t2m_mou,loc_ic_t2m_mou,loc_ic_t2m_mou,"loc_ic_t2m_mou,로컬수신T2M통화시간,로컬수신타사MOU,로컬수신타사모바일통화시간",통화,raw_telecom_fact_call_incoming.loc_ic_t2m_mou,y
+term_raw_telecom_fact_call_incoming.loc_ic_t2f_mou,loc_ic_t2f_mou,loc_ic_t2f_mou,"loc_ic_t2f_mou,로컬수신T2F통화시간,로컬수신유선MOU,로컬수신유선통화시간",통화,raw_telecom_fact_call_incoming.loc_ic_t2f_mou,y
+term_raw_telecom_fact_call_incoming.loc_ic_mou,loc_ic_mou,loc_ic_mou,"loc_ic_mou,로컬수신MOU,로컬수신통화분,로컬수신통화시간",통화,raw_telecom_fact_call_incoming.loc_ic_mou,y
+term_raw_telecom_fact_call_incoming.std_ic_t2t_mou,std_ic_t2t_mou,std_ic_t2t_mou,"std_ic_t2t_mou,장거리수신T2T통화시간,장거리수신동일사통화시간,장거리수신동일통신사MOU",통화,raw_telecom_fact_call_incoming.std_ic_t2t_mou,y
+term_raw_telecom_fact_call_incoming.std_ic_t2m_mou,std_ic_t2m_mou,std_ic_t2m_mou,"std_ic_t2m_mou,장거리수신T2M통화시간,장거리수신타사MOU,장거리수신타사모바일통화시간",통화,raw_telecom_fact_call_incoming.std_ic_t2m_mou,y
+term_raw_telecom_fact_call_incoming.std_ic_t2f_mou,std_ic_t2f_mou,std_ic_t2f_mou,"Long Distance Incoming Fixed MOU,std_ic_t2f_mou,수신 유선 통화시간,장거리 수신 유선 MOU",통화,raw_telecom_fact_call_incoming.std_ic_t2f_mou,y
+term_raw_telecom_fact_call_incoming.std_ic_t2o_mou,std_ic_t2o_mou,std_ic_t2o_mou,"Long Distance Incoming Other Operator MOU,std_ic_t2o_mou,수신 타사 통화시간,장거리 수신 타사 MOU",통화,raw_telecom_fact_call_incoming.std_ic_t2o_mou,y
+term_raw_telecom_fact_call_incoming.std_ic_mou,std_ic_mou,std_ic_mou,"Long Distance Incoming MOU,std_ic_mou,장거리 수신 통화,장거리 수신 통화시간",통화,raw_telecom_fact_call_incoming.std_ic_mou,y
+term_raw_telecom_fact_call_incoming.total_ic_mou,total_ic_mou,total_ic_mou,"Total Incoming MOU,total_ic_mou,수신 통화 총합,총 수신 통화시간",통화,raw_telecom_fact_call_incoming.total_ic_mou,y
+term_raw_telecom_fact_call_incoming.spl_ic_mou,spl_ic_mou,spl_ic_mou,"Special Incoming MOU,spl_ic_mou,특수 수신 MOU,특수 수신 통화시간",통화,raw_telecom_fact_call_incoming.spl_ic_mou,y
+term_raw_telecom_fact_call_incoming.isd_ic_mou,isd_ic_mou,isd_ic_mou,"International Incoming MOU,isd_ic_mou,국제 수신 MOU,국제 수신 통화시간",통화,raw_telecom_fact_call_incoming.isd_ic_mou,y
+term_raw_telecom_fact_call_incoming.ic_others,ic_others,ic_others,"Incoming Others MOU,ic_others,기타 수신 통화시간,수신 기타 MOU",통화,raw_telecom_fact_call_incoming.ic_others,y
+term_raw_telecom_fact_call_outgoing.mobile_number,mobile_number,mobile_number,"Mobile No.,mobile_number,이동전화 번호,핸드폰 번호,휴대폰 번호",가입,raw_telecom_fact_call_outgoing.mobile_number,y
+term_raw_telecom_fact_call_outgoing.month,month,month,"YYYYMM,month,기준월,데이터 기준월,연월",기타,raw_telecom_fact_call_outgoing.month,y
+term_raw_telecom_fact_call_outgoing.aon,aon,aon,"Age of Number,aon,가입 경과일,가입 기간(일),가입일수",가입,raw_telecom_fact_call_outgoing.aon,y
+term_raw_telecom_fact_call_outgoing.onnet_mou,onnet_mou,onnet_mou,"On-net MOU,onnet_mou,내부망 통화,동일망 통화시간,자사망 통화시간",통화,raw_telecom_fact_call_outgoing.onnet_mou,y
+term_raw_telecom_fact_call_outgoing.offnet_mou,offnet_mou,offnet_mou,"Off-net MOU,offnet_mou,외부망 통화시간,타사 통화,타사망 통화시간",통화,raw_telecom_fact_call_outgoing.offnet_mou,y
+term_raw_telecom_fact_call_outgoing.roam_og_mou,roam_og_mou,roam_og_mou,"Roaming Outgoing MOU,roam_og_mou,로밍 발신 MOU,로밍 발신 통화시간,로밍 통화",통화,raw_telecom_fact_call_outgoing.roam_og_mou,y
+term_raw_telecom_fact_call_outgoing.loc_og_t2t_mou,loc_og_t2t_mou,loc_og_t2t_mou,"Local Outgoing Same Operator MOU,loc_og_t2t_mou,로컬 발신 동일사 통화시간,로컬 발신 자사 통화,지역내 동일사 통화",통화,raw_telecom_fact_call_outgoing.loc_og_t2t_mou,y
+term_raw_telecom_fact_call_outgoing.loc_og_t2m_mou,loc_og_t2m_mou,loc_og_t2m_mou,"Local Outgoing Other Mobile MOU,loc_og_t2m_mou,로컬 발신 타사 모바일 MOU,로컬 발신 타사 모바일 통화,지역내 타사 모바일 통화",통화,raw_telecom_fact_call_outgoing.loc_og_t2m_mou,y
+term_raw_telecom_fact_call_outgoing.loc_og_t2f_mou,loc_og_t2f_mou,loc_og_t2f_mou,"Loc OG Fixed,Local Outgoing Fixed,loc_og_t2f_mou,로컬 유선 통화시간,로컬발신유선",통화,raw_telecom_fact_call_outgoing.loc_og_t2f_mou,y
+term_raw_telecom_fact_call_outgoing.loc_og_t2c_mou,loc_og_t2c_mou,loc_og_t2c_mou,"Loc OG Call Center,Local Outgoing Call Center,loc_og_t2c_mou,로컬 콜센터 통화시간,로컬발신콜센터",통화,raw_telecom_fact_call_outgoing.loc_og_t2c_mou,y
+term_raw_telecom_fact_call_outgoing.loc_og_mou,loc_og_mou,loc_og_mou,"Loc OG,Local Outgoing,loc_og_mou,로컬 통화시간,로컬발신통화",통화,raw_telecom_fact_call_outgoing.loc_og_mou,y
+term_raw_telecom_fact_call_outgoing.std_og_t2t_mou,std_og_t2t_mou,std_og_t2t_mou,"STD Outgoing Same Telco,Std OG T2T,std_og_t2t_mou,장거리 동일통신사 통화시간,장거리발신동일사",통화,raw_telecom_fact_call_outgoing.std_og_t2t_mou,y
+term_raw_telecom_fact_call_outgoing.std_og_t2m_mou,std_og_t2m_mou,std_og_t2m_mou,"STD Outgoing Other Mobile,Std OG T2M,std_og_t2m_mou,장거리 타사 모바일 통화시간,장거리발신타사모바일",통화,raw_telecom_fact_call_outgoing.std_og_t2m_mou,y
+term_raw_telecom_fact_call_outgoing.std_og_t2f_mou,std_og_t2f_mou,std_og_t2f_mou,"STD Outgoing Fixed,Std OG Fixed,std_og_t2f_mou,장거리 유선 통화시간,장거리발신유선",통화,raw_telecom_fact_call_outgoing.std_og_t2f_mou,y
+term_raw_telecom_fact_call_outgoing.std_og_t2c_mou,std_og_t2c_mou,std_og_t2c_mou,"STD Outgoing Call Center,Std OG Call Center,std_og_t2c_mou,장거리 콜센터 통화시간,장거리발신콜센터",통화,raw_telecom_fact_call_outgoing.std_og_t2c_mou,y
+term_raw_telecom_fact_call_outgoing.std_og_mou,std_og_mou,std_og_mou,"STD Outgoing,Std OG,std_og_mou,장거리 통화시간,장거리발신통화",통화,raw_telecom_fact_call_outgoing.std_og_mou,y
+term_raw_telecom_fact_call_outgoing.isd_og_mou,isd_og_mou,isd_og_mou,"ISD Outgoing,International Outgoing,isd_og_mou,국제 통화시간,국제발신통화",통화,raw_telecom_fact_call_outgoing.isd_og_mou,y
+term_raw_telecom_fact_call_outgoing.spl_og_mou,spl_og_mou,spl_og_mou,"Special Outgoing,Spl OG,spl_og_mou,특수 통화시간,특수발신통화",통화,raw_telecom_fact_call_outgoing.spl_og_mou,y
+term_raw_telecom_fact_call_outgoing.og_others,og_others,og_others,"OG Others,Outgoing Others,og_others,기타 발신 통화시간,발신기타통화",통화,raw_telecom_fact_call_outgoing.og_others,y
+term_raw_telecom_fact_call_outgoing.total_og_mou,total_og_mou,total_og_mou,"Total OG,Total Outgoing,total_og_mou,총 통화시간,총발신통화",통화,raw_telecom_fact_call_outgoing.total_og_mou,y
+term_raw_telecom_fact_data_usage.mobile_number,mobile_number,mobile_number,"MSISDN,Mobile No.,mobile_number,이동전화번호,휴대폰번호",가입,raw_telecom_fact_data_usage.mobile_number,y
+term_raw_telecom_fact_data_usage.month,month,month,"YYYYMM,YearMonth,month,기준월,연월",과금,raw_telecom_fact_data_usage.month,y
+term_raw_telecom_fact_data_usage.aon,aon,aon,"Active On Network,aon,가입경과일,가입기간(일),가입일수",가입,raw_telecom_fact_data_usage.aon,y
+term_raw_telecom_fact_data_usage.vol_2g_mb,vol_2g_mb,vol_2g_mb,"2G 데이터 사용량,2G 데이터량,2G 트래픽,vol_2g_mb",과금,raw_telecom_fact_data_usage.vol_2g_mb,y
+term_raw_telecom_fact_data_usage.vol_3g_mb,vol_3g_mb,vol_3g_mb,"3G 데이터 사용량,3G 데이터량,3G 트래픽,vol_3g_mb",과금,raw_telecom_fact_data_usage.vol_3g_mb,y
+term_raw_telecom_fact_data_usage.arpu_2g,arpu_2g,arpu_2g,"2G ARPU,2G 가입자당평균매출,2G 평균매출,arpu_2g",과금,raw_telecom_fact_data_usage.arpu_2g,y
+term_raw_telecom_fact_data_usage.arpu_3g,arpu_3g,arpu_3g,"3G ARPU,3G 가입자당평균매출,3G 평균매출,arpu_3g",과금,raw_telecom_fact_data_usage.arpu_3g,y
+term_raw_telecom_fact_data_usage.night_pck_user,night_pck_user,night_pck_user,"night_pck_user,야간 요금제 가입자,야간 전용 요금제,야간 패키지 사용자",가입,raw_telecom_fact_data_usage.night_pck_user,y
+term_raw_telecom_fact_data_usage.monthly_2g,monthly_2g,monthly_2g,"2G 월간 요금제,2G 월정액,2G 정액제,monthly_2g",과금,raw_telecom_fact_data_usage.monthly_2g,y
+term_raw_telecom_fact_data_usage.sachet_2g,sachet_2g,sachet_2g,"2G 소액 데이터,2G 소액 요금제,2G 소액 패키지,sachet_2g",과금,raw_telecom_fact_data_usage.sachet_2g,y
+term_raw_telecom_fact_data_usage.monthly_3g,monthly_3g,monthly_3g,"3G 월간 요금제,3G 월정액,3G 정액제,monthly_3g",과금,raw_telecom_fact_data_usage.monthly_3g,y
+term_raw_telecom_fact_data_usage.sachet_3g,sachet_3g,sachet_3g,"3G 소액 데이터,3G 소액 요금제,3G 소액 패키지,sachet_3g",과금,raw_telecom_fact_data_usage.sachet_3g,y
+term_raw_telecom_fact_data_usage.fb_user,fb_user,fb_user,"fb_user,페북 사용자,페이스북 데이터 무료 사용자,페이스북 우대 사용자",가입,raw_telecom_fact_data_usage.fb_user,y
+term_raw_telecom_fact_data_usage.vbc_3g,vbc_3g,vbc_3g,"3G 과금 금액,3G 데이터 과금,3G 사용량 과금,vbc_3g",과금,raw_telecom_fact_data_usage.vbc_3g,y
+term_raw_telecom_fact_recharge_data.mobile_number,mobile_number,mobile_number,"mobile_number,모바일 번호,핸드폰 번호,휴대폰 번호",가입,raw_telecom_fact_recharge_data.mobile_number,y
+term_raw_telecom_fact_recharge_data.month,month,month,"month,기준 월,데이터 기준월,연월",기타,raw_telecom_fact_recharge_data.month,y
+term_raw_telecom_fact_recharge_data.aon,aon,aon,"aon,가입 경과일,가입 기간(일),가입일수",가입,raw_telecom_fact_recharge_data.aon,y
+term_raw_telecom_fact_recharge_data.date_of_last_rech_data,date_of_last_rech_data,date_of_last_rech_data,"date_of_last_rech_data,마지막 충전 날짜,최근 충전일,최종 충전일",과금,raw_telecom_fact_recharge_data.date_of_last_rech_data,y
+term_raw_telecom_fact_recharge_data.total_rech_data,total_rech_data,total_rech_data,"Data Recharge Total,Total Data Recharge,total_rech_data,총충전데이터,충전데이터총량",과금,raw_telecom_fact_recharge_data.total_rech_data,y
+term_raw_telecom_fact_recharge_data.max_rech_data,max_rech_data,max_rech_data,"Max Data Recharge,max_rech_data,최대충전데이터,최대충전량,충전데이터최대",과금,raw_telecom_fact_recharge_data.max_rech_data,y
+term_raw_telecom_fact_recharge_data.count_rech_2g,count_rech_2g,count_rech_2g,"2G Recharge Count,2G충전건수,2G충전수,2G충전횟수,count_rech_2g",과금,raw_telecom_fact_recharge_data.count_rech_2g,y
+term_raw_telecom_fact_recharge_data.count_rech_3g,count_rech_3g,count_rech_3g,"3G Recharge Count,3G충전건수,3G충전수,3G충전횟수,count_rech_3g",과금,raw_telecom_fact_recharge_data.count_rech_3g,y
+term_raw_telecom_fact_recharge_data.av_rech_amt_data,av_rech_amt_data,av_rech_amt_data,"Average Recharge Amount,av_rech_amt_data,충전금액평균,평균충전금액,평균충전액",과금,raw_telecom_fact_recharge_data.av_rech_amt_data,y
+term_raw_telecom_fact_recharge_voice.mobile_number,mobile_number,mobile_number,"MSISDN,mobile_number,전화번호,핸드폰번호,휴대폰번호",가입,raw_telecom_fact_recharge_voice.mobile_number,y
+term_raw_telecom_fact_recharge_voice.month,month,month,"YYYYMM,month,기준연월,기준월,연월",기타,raw_telecom_fact_recharge_voice.month,y
+term_raw_telecom_fact_recharge_voice.aon,aon,aon,"Age On Network,aon,가입경과일,가입기간,가입일수",가입,raw_telecom_fact_recharge_voice.aon,y
+term_raw_telecom_fact_recharge_voice.total_rech_num,total_rech_num,total_rech_num,"Total Recharge Count,total_rech_num,총충전건수,충전건수,충전횟수",과금,raw_telecom_fact_recharge_voice.total_rech_num,y
+term_raw_telecom_fact_recharge_voice.total_rech_amt,total_rech_amt,total_rech_amt,"Total Recharge Amount,total_rech_amt,총충전금액,충전금액합계,충전총액",과금,raw_telecom_fact_recharge_voice.total_rech_amt,y
+term_raw_telecom_fact_recharge_voice.max_rech_amt,max_rech_amt,max_rech_amt,"Max Recharge Amount,max_rech_amt,최대충전금액,최대충전액,충전금액최대",과금,raw_telecom_fact_recharge_voice.max_rech_amt,y
+term_raw_telecom_fact_recharge_voice.date_of_last_rech,date_of_last_rech,date_of_last_rech,"Last Recharge Date,date_of_last_rech,마지막충전일,최근충전일,최종충전일",과금,raw_telecom_fact_recharge_voice.date_of_last_rech,y
+term_raw_telecom_fact_recharge_voice.last_day_rch_amt,last_day_rch_amt,last_day_rch_amt,"Last Day Recharge Amount,last_day_rch_amt,당일충전금액,최근당일충전액,최근충전당일금액",과금,raw_telecom_fact_recharge_voice.last_day_rch_amt,y
+term_raw_telecom_fact_recharge_voice.arpu,arpu,arpu,"1인당평균매출,Average Revenue Per User,arpu,가입자평균매출,평균매출",과금,raw_telecom_fact_recharge_voice.arpu,y
