@@ -9,15 +9,18 @@ agents/parsing_agent.py
 - 헤더 "행" 탐지: 더 이상 1~3행으로 제한하지 않고 시트 전체를 스캔한다.
   확실한 후보(hits>=3)가 정확히 1개면 규칙만으로 확정하고(LLM 호출 없음),
   후보가 0개 또는 2개 이상으로 애매할 때만 LLM(gpt-4.1-mini)이 후보 중에서 판단한다
-  (select_header_row_with_llm).
+  (select_header_row_with_llm). 그래도 못 찾으면 시트 미리보기를 보여주고 담당자가
+  직접 헤더 행 번호를 고르게 한다(header_row_confirmation).
 - 헤더 "필드" 매핑: 규칙 기반 매핑(map_columns_by_header)만으로 표준 필드를 못 찾을 경우,
-  LLM(gpt-4.1-mini) fallback을 거쳐 재시도한다(generate_header_mapping_judgment).
-- 그래도 못 찾으면 기존처럼 ValueError로 파일 전체를 중단시키지 않고,
+  헤더명+샘플값을 근거로 LLM(gpt-4.1-mini) fallback을 거쳐 재시도한다(generate_header_mapping_judgment).
+  그래도 못 찾으면 기존처럼 ValueError로 파일 전체를 중단시키지 않고,
   confirm_fn(콘솔 input() 또는 LangGraph interrupt())을 통해 담당자가
-  직접 원본 헤더 중 하나를 골라 확정할 수 있게 라우팅한다.
+  직접 원본 헤더 중 하나를 골라 확정할 수 있게 라우팅한다(header_mapping_confirmation).
 - 행 단위 보완: 영문명/한글명/항목설명 중 1개 이상만 있으면(전부는 아님) 즉시 실패 처리하지 않고,
   메타DB(schemascout_meta.duckdb) 매칭을 우선 시도하고 후보가 없으면 LLM 추론으로 나머지를 채운다.
   제안값은 파싱이 모두 끝난 뒤 한 번에(row_completion_confirmation) 담당자 확인을 받는다.
+- type은 필수 필드가 아니다. 행에 type이 없으면 실패 처리하지 않고 빈 채로 다음 Agent(DB Validation)에
+  넘겨 실 DB 기준으로 처리하게 한다(시점(기간)과 동일한 취급).
 """
 
 import json
@@ -46,9 +49,12 @@ STANDARD_FIELDS = {
     "시점(기간)": ["기간", "시점", "period", "요구기간"],
 }
 # 시점(기간)은 필수 아님 - 미기재 시 보유 기간 전체를 참고로 제공(Classification Agent에서 처리)
-REQUIRED_FIELDS = ["영문명", "한글명", "항목설명", "type"]
+# type도 필수 아님 - 행에 없으면 빈 채로 다음 Agent(DB Validation)로 넘겨 실 DB 기준으로 처리
+REQUIRED_FIELDS = ["영문명", "한글명", "항목설명"]
 # 한 행에 최소 1개만 있어도 나머지를 메타DB/LLM으로 보완 시도하는 대상 필드
 NAME_FIELDS = ["영문명", "한글명", "항목설명"]
+# parsed_rows 출력 시 고정 필드 순서 - type/시점(기간)은 없으면 빈 값(None)으로 채워서 항상 이 순서로 노출
+OUTPUT_FIELD_ORDER = ["영문명", "한글명", "항목설명", "type", "시점(기간)"]
 
 # LLM 헤더 매핑 fallback 확신도 임계값 (실측 전 초기값 - 추후 조정 예정)
 HEADER_LLM_CONFIDENCE_FLOOR = 0.75
@@ -79,15 +85,15 @@ def _find_header_row_candidates(raw: pd.DataFrame, min_hits: int = 3) -> list:
     return candidates
 
 
-def select_header_row_with_llm(candidates: list) -> int:
+def select_header_row_with_llm(candidates: list) -> tuple:
     """
     후보 헤더 행이 0개 또는 2개 이상으로 애매할 때, 후보 행들의 내용을 LLM(gpt-4.1-mini)에게
     보여주고 실제 명세 헤더 행이 어느 것인지 판단시킨다.
     candidates 목록 밖의 행 번호를 응답하지 못하도록 프롬프트로 제약(hallucination 방지).
-    반환: 선택된 row_idx, 적합한 후보가 없으면 None
+    반환: (선택된 row_idx 또는 None, evidence)
     """
     if not candidates:
-        return None
+        return None, "후보 행이 전혀 없음"
 
     from llm_client import chat
 
@@ -101,7 +107,7 @@ def select_header_row_with_llm(candidates: list) -> int:
         "이 중 설명/요약 문구가 아니라 실제 표의 컬럼 헤더 역할을 하는 행 하나를 고른다.\n"
         "반드시 다음 JSON 스키마로만 응답한다:\n"
         '{"header_row_idx": 후보 목록 중 하나의 row_idx(정수) 또는 null(적합한 행 없음), '
-        '"evidence": "40자 내외, 왜 이 행을 선택했는지"}'
+        '"evidence": "40자 내외, 왜 이 행을 선택했는지(또는 왜 못 골랐는지)"}'
     )
     user_prompt = f"후보 행 목록:\n{candidate_lines}"
 
@@ -117,14 +123,52 @@ def select_header_row_with_llm(candidates: list) -> int:
         )
     parsed = json.loads(response.choices[0].message.content)
     selected = parsed.get("header_row_idx")
+    evidence = parsed.get("evidence", "")
 
     valid_indices = {c["row_idx"] for c in candidates}
     if selected in valid_indices:
-        return selected
-    return None
+        return selected, evidence
+    return None, evidence
 
 
-def parse_excel_to_df(file_path: str) -> pd.DataFrame:
+# ── 담당자 확인 (헤더 "행" 판별 실패 시) ─────────────────────
+def _console_header_row_confirm(payload: dict) -> dict:
+    print("\n" + "=" * 60)
+    print("[담당자 확인 요청 - 헤더 행 판별 실패]")
+    for a in payload["attempts"]:
+        print(f"  - {a['method']}: {a['detail']}")
+    print("  원본 시트 미리보기:")
+    for r in payload["row_previews"]:
+        print(f"    [{r['row_idx']}] {r['preview']}")
+    ans = input("헤더 행 번호를 입력하세요 (없으면 그냥 엔터): ").strip()
+    if not ans:
+        return {"decision": "rejected"}
+    return {"decision": "approved", "selected_row_idx": int(ans)}
+
+
+def request_header_row_confirmation(raw: pd.DataFrame, attempts: list, confirm_fn=None) -> dict:
+    """규칙+LLM으로도 헤더 행을 못 찾았을 때, 담당자가 시트 미리보기에서 직접 행 번호를 고르게 한다.
+    반환: {"decision": "approved"|"rejected", "selected_row_idx": int 또는 None}
+    """
+    scan_range = min(len(raw), 10)
+    row_previews = [
+        {"row_idx": i, "preview": [str(v) for v in raw.iloc[i].tolist()]}
+        for i in range(scan_range)
+    ]
+    payload = {
+        "type": "header_row_confirmation",
+        "attempts": attempts,
+        "row_previews": row_previews,
+    }
+    fn = confirm_fn or _console_header_row_confirm
+    raw_decision = fn(payload)
+    if isinstance(raw_decision, dict):
+        return {"decision": raw_decision.get("decision"), "selected_row_idx": raw_decision.get("selected_row_idx")}
+    # confirm_fn이 단순 문자열만 반환하는 경우 - 근거(선택된 행)가 없으므로 거절 처리
+    return {"decision": "rejected", "selected_row_idx": None}
+
+
+def parse_excel_to_df(file_path: str, confirm_fn=None) -> pd.DataFrame:
     """엑셀 파일을 DataFrame으로 로드, 헤더 자동 탐지(행 위치 제한 없이 시트 전체 스캔)"""
     with tool_span("read_excel"):
         raw = pd.read_excel(file_path, header=None)
@@ -140,12 +184,22 @@ def parse_excel_to_df(file_path: str) -> pd.DataFrame:
         # 후보가 0개(기준을 못 넘음) 또는 2개 이상(애매함)이면 LLM에게 판단을 맡김.
         # 0개인 경우 기준을 완화(hits>=2)해 판단 대상 후보를 넓혀준다.
         candidates_for_llm = strong_candidates if strong_candidates else _find_header_row_candidates(raw, min_hits=2)
-        header_row_idx = select_header_row_with_llm(candidates_for_llm)
+        header_row_idx, llm_evidence = select_header_row_with_llm(candidates_for_llm)
 
         if header_row_idx is None:
-            raise ValueError(
-                f"헤더 행을 찾을 수 없습니다 (규칙 후보 {len(strong_candidates)}개, LLM 판단도 실패)"
-            )
+            # 규칙+LLM 모두 실패 -> 시트 미리보기를 보여주고 담당자가 직접 헤더 행을 고르게 함
+            attempts = [
+                {"method": "규칙 스캔", "detail": f"표준 필드 키워드 3개 이상 매칭 행 {len(strong_candidates)}개"},
+                {"method": "LLM 판단 (gpt-4.1-mini)", "detail": llm_evidence or "적합한 헤더 행을 찾지 못함"},
+            ]
+            decision = request_header_row_confirmation(raw, attempts, confirm_fn=confirm_fn)
+            if decision["decision"] == "approved" and decision.get("selected_row_idx") is not None:
+                header_row_idx = decision["selected_row_idx"]
+            else:
+                raise ValueError(
+                    f"헤더 행을 찾을 수 없습니다 (규칙 후보 {len(strong_candidates)}개, "
+                    f"LLM 판단·담당자 확인 모두 실패)"
+                )
 
     df = pd.read_excel(file_path, header=header_row_idx)
     df = df.dropna(how="all")  # 완전 빈 행 제거
@@ -169,13 +223,15 @@ def map_columns_by_header(df: pd.DataFrame, header_row: int = 0) -> dict:
 
 
 # ── Tool 2.5 (신규): generate_header_mapping_judgment ──────
-def generate_header_mapping_judgment(missing_std_fields: list, unmapped_columns: list) -> list:
+def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame, unmapped_columns: list) -> list:
     """
     규칙 매칭 실패한 표준 필드에 한해, 아직 배정되지 않은 원본 헤더 후보 중
     최적 매칭을 LLM(gpt-4.1-mini)으로 판단.
+    헤더명뿐 아니라 실제 셀 샘플값도 함께 보여준다 — "필드코드" 같은 헤더는 이름만으로는
+    영문명 여부를 알 수 없고 값이 'cust_id' 같은 영문 식별자인지 봐야 판단 가능하기 때문.
     후보(unmapped_columns) 밖의 컬럼명을 응답하지 못하도록 프롬프트로 제약(hallucination 방지).
 
-    입력: missing_std_fields(list[str]), unmapped_columns(list[str])
+    입력: missing_std_fields(list[str]), df(원본 DataFrame, 샘플값 추출용), unmapped_columns(list[str])
     출력: [{std_field, matched_column|null, confidence, evidence}]
     """
     if not missing_std_fields or not unmapped_columns:
@@ -183,18 +239,28 @@ def generate_header_mapping_judgment(missing_std_fields: list, unmapped_columns:
 
     from llm_client import chat  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
 
+    header_samples = []
+    for col in unmapped_columns:
+        non_null = df[col].dropna()
+        samples = [str(v) for v in non_null.head(3).tolist()]
+        header_samples.append({"name": col, "samples": samples})
+
     system_prompt = (
         "너는 데이터 명세서 헤더를 표준 필드로 매핑하는 보조자다.\n"
-        "아래 \"매핑이 필요한 표준 필드 목록\"과 \"아직 매핑되지 않은 원본 헤더 목록\"만 근거로 판단한다.\n"
+        "아래 \"매핑이 필요한 표준 필드 목록\"과 \"아직 매핑되지 않은 원본 헤더 목록\"(헤더명 + 실제 셀 샘플값)만 "
+        "근거로 판단한다.\n"
+        "헤더명 자체가 애매해도 샘플값의 패턴(예: 영문 snake_case 식별자, 한글 명칭, 날짜 형식 등)을 "
+        "적극 활용해 판단한다. 예를 들어 헤더명이 '필드코드'라도 샘플값이 'cust_id', 'cust_name'처럼 "
+        "영문 식별자라면 영문명일 가능성이 높다.\n"
         "원본 헤더 목록에 없는 컬럼명을 임의로 만들어내지 않는다.\n"
         "하나의 원본 헤더는 하나의 표준 필드에만 매핑한다.\n"
         "반드시 다음 JSON 스키마로만 응답한다:\n"
         '{"mappings": [{"std_field": "표준 필드명", "matched_column": "원본 헤더 목록 중 하나 또는 null(적합한 헤더 없음)", '
-        '"confidence": 0.0, "evidence": "40자 내외, 왜 이 헤더를 선택했는지(또는 왜 못 찾았는지)"}]}'
+        '"confidence": 0.0, "evidence": "40자 내외, 왜 이 헤더를 선택했는지(또는 왜 못 찾았는지, 샘플값 근거 포함)"}]}'
     )
     user_prompt = (
         f"매핑이 필요한 표준 필드 목록: {missing_std_fields}\n"
-        f"아직 매핑되지 않은 원본 헤더 목록: {unmapped_columns}"
+        f"아직 매핑되지 않은 원본 헤더 목록(헤더명 + 샘플값): {json.dumps(header_samples, ensure_ascii=False)}"
     )
 
     with tool_span("generate_header_mapping_judgment", model="gpt-4.1-mini"):
@@ -225,12 +291,14 @@ def _json_safe(value):
 
 # ── Tool 3: validate_row_schema ────────────────────────────
 def validate_row_schema(row: dict) -> dict:
-    """행별 필수 필드 존재/공백 여부 검증 -> {valid, missing_fields}"""
+    """행별 필수 필드 존재/공백 여부 검증 -> {valid, missing_fields}
+    영문명/한글명/항목설명 중 최소 1개만 있으면 유효 처리 -> Meta Search Agent가 있는 정보로 매칭을
+    시도할 수 있게 한다. 셋 다 없는 행만 무효(파싱 실패) 처리."""
     missing = [
-        f for f in REQUIRED_FIELDS
+        f for f in NAME_FIELDS
         if f not in row or row[f] is None or str(row[f]).strip() in ("", "nan")
     ]
-    return {"valid": len(missing) == 0, "missing_fields": missing}
+    return {"valid": len(missing) < len(NAME_FIELDS), "missing_fields": missing}
 
 
 # ── Tool 4: map_candidate_tables ───────────────────────────
@@ -485,7 +553,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
     }
 
     # Step 1: 파일 로드 + 헤더 탐지
-    df = parse_excel_to_df(file_path)
+    df = parse_excel_to_df(file_path, confirm_fn=confirm_fn)
 
     # Step 2: 규칙 기반 매핑
     header_mapping = map_columns_by_header(df)
@@ -498,7 +566,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
     # Step 2.5: LLM fallback (규칙 매칭 실패한 필드만, 예외 케이스에서만 호출)
     if missing_std_fields:
         unmapped_columns = [str(c) for c in df.columns if c not in header_mapping.values()]
-        llm_results = generate_header_mapping_judgment(missing_std_fields, unmapped_columns)
+        llm_results = generate_header_mapping_judgment(missing_std_fields, df, unmapped_columns)
 
         for m in llm_results:
             std_field = m.get("std_field")
@@ -552,9 +620,11 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
                 "missing_fields": validation["missing_fields"],
             })
             return
-        # Step 5: 후보 테이블 매핑
-        candidates = map_candidate_tables(str(row["영문명"]).strip())
-        state["candidate_tables"][row["영문명"]] = candidates
+        # Step 5: 후보 테이블 매핑 (영문명이 있을 때만 - 없으면 조회할 근거가 없음)
+        eng_name = row.get("영문명")
+        if eng_name:
+            candidates = map_candidate_tables(str(eng_name).strip())
+            state["candidate_tables"][eng_name] = candidates
         state["parsed_rows"].append(row)
 
     meta_con = None
@@ -562,9 +632,10 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
     rows_by_idx = {}
 
     for idx, raw_row in df.iterrows():
+        # 출력 순서 고정: 영문명/한글명/항목설명/type/시점(기간). 헤더에서 못 찾은 필드는 None으로 비움.
         row = {
-            std_field: _json_safe(raw_row[orig_col])
-            for std_field, orig_col in header_mapping.items()
+            std_field: (_json_safe(raw_row[header_mapping[std_field]]) if std_field in header_mapping else None)
+            for std_field in OUTPUT_FIELD_ORDER
         }
         rows_by_idx[idx] = row
 

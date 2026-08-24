@@ -225,7 +225,8 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
                 {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            temperature=0.2,
+            # gpt-5-mini는 reasoning 계열이라 temperature 커스텀 값을 지원하지 않음
+            # (400 Unsupported value: 'temperature' ... Only the default (1) value is supported.)
             response_format={"type": "json_object"},
         )
     text = resp.choices[0].message.content.strip()

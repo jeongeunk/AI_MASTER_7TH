@@ -38,7 +38,7 @@ if upload_result:
                 f"tool 호출 {len(t['tool_calls'])}건. 상세 내역은 왼쪽 사이드바의 "
                 f"**모니터링** 페이지에서 확인하세요.")
 
-    st.subheader("미리보기 (최대 10건)")
+    st.subheader(f"미리보기 (전체 {len(upload_result['preview'])}건)")
     st.dataframe(upload_result["preview"], use_container_width=True)
 
     if upload_result["failed_rows"]:
