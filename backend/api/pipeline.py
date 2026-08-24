@@ -3,12 +3,17 @@ backend/api/pipeline.py
 
 - POST /api/pipeline/start                    : 파이프라인 백그라운드 실행 시작
 - GET  /api/pipeline/{thread_id}/events        : 노드별 진행 로그 폴링 (tool/LLM 정보 포함)
-- POST /api/pipeline/{thread_id}/confirm       : 담당자 확인(승인/거절) 응답 제출
+- POST /api/pipeline/{thread_id}/confirm       : 담당자 확인 응답 제출
+      - 단순 승인/거절: {"decision": "approved"} 또는 {"decision": "rejected"}
+      - 헤더 매핑 확인처럼 부가 정보가 필요한 경우:
+        {"decision": {"decision": "approved", "selected_column": "컬럼명"}}
+        또는 {"decision": {"decision": "rejected"}}
 - GET  /api/pipeline/{thread_id}/results       : 컬럼별 결과 테이블 조회
 - GET  /api/pipeline/{thread_id}/download      : 최종 명세서 엑셀 다운로드
 """
 
 import os
+from typing import Union
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -30,7 +35,22 @@ class StartRequest(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
-    decision: str  # "approved" | "rejected"
+    # 기존(Meta Search/DB Validation): 단순 문자열 "approved" | "rejected"
+    # 신규(헤더 매핑 확인 등 부가 정보가 필요한 케이스): {"decision": "approved"|"rejected", ...추가필드}
+    decision: Union[str, dict]
+
+
+def _validate_decision(decision: Union[str, dict]) -> None:
+    if isinstance(decision, str):
+        if decision not in ("approved", "rejected"):
+            raise HTTPException(status_code=400, detail="decision 문자열은 approved 또는 rejected여야 합니다.")
+        return
+    if isinstance(decision, dict):
+        inner = decision.get("decision")
+        if inner not in ("approved", "rejected"):
+            raise HTTPException(status_code=400, detail="decision.decision 필드는 approved 또는 rejected여야 합니다.")
+        return
+    raise HTTPException(status_code=400, detail="decision은 문자열 또는 객체여야 합니다.")
 
 
 @router.post("/pipeline/start")
@@ -51,8 +71,7 @@ def events(thread_id: str, since: int = 0):
 
 @router.post("/pipeline/{thread_id}/confirm")
 def confirm(thread_id: str, req: ConfirmRequest):
-    if req.decision not in ("approved", "rejected"):
-        raise HTTPException(status_code=400, detail="decision은 approved 또는 rejected여야 합니다.")
+    _validate_decision(req.decision)
     try:
         submit_confirmation(thread_id, req.decision)
     except KeyError as e:

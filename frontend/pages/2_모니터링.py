@@ -2,6 +2,9 @@
 frontend/pages/2_모니터링.py
 
 파이프라인 진행 상황(어떤 tool/LLM을 쓰고 있는지) 실시간 확인 + 담당자 확인(HITL) 승인/거절
+- inferred_confirmation, type_mismatch_confirmation: 기존 승인/거절 화면
+- header_mapping_confirmation (신규): Parsing Agent가 규칙+LLM 매핑에 모두 실패했을 때,
+  원본 헤더를 가로로 나열하고 아직 안 정해진 헤더만 라디오로 고를 수 있게 함
 """
 
 import time
@@ -49,30 +52,91 @@ if status == "error":
 if status == "waiting_human" and snapshot["confirm_payload"]:
     payload = snapshot["confirm_payload"]
     st.warning("담당자 확인이 필요합니다.")
+
+    # 실패 유형 배지 (헤더 매핑 실패는 다른 색으로 구분)
+    if payload["type"] == "header_mapping_confirmation":
+        st.markdown(
+            "<span style='font-size:13px;padding:3px 10px;border-radius:6px;"
+            "background:#FAEEDA;color:#854F0B;font-weight:600;'>헤더 매핑 실패</span>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<span style='font-size:13px;padding:3px 10px;border-radius:6px;"
+            "background:#E6F1FB;color:#0C447C;font-weight:600;'>행/컬럼 단위 확인</span>",
+            unsafe_allow_html=True,
+        )
+
     with st.container(border=True):
+        selected_header = None  # header_mapping_confirmation에서만 사용
+
         if payload["type"] == "inferred_confirmation":
             st.markdown(f"**원본 컬럼**: {payload['eng_name']} / {payload['kor_name']}")
             st.markdown(f"**원본 설명**: {payload['description']}")
-            st.markdown(f"**LLM 확신도**: {payload['llm_confidence']}")
-            st.markdown(f"**LLM 근거**: {payload['llm_evidence']}")
-            st.markdown("**후보**")
-            st.dataframe(payload["candidates"], use_container_width=True)
+            st.markdown(f"**LLM 확신도**: {payload.get('llm_confidence', payload.get('similarity_score'))}")
+            st.markdown(f"**LLM 근거**: {payload.get('llm_evidence', payload.get('match_evidence', ''))}")
+            if "candidates" in payload:
+                st.markdown("**후보**")
+                st.dataframe(payload["candidates"], use_container_width=True)
+            elif "candidate_column" in payload:
+                st.markdown(f"**매칭 후보**: {payload['candidate_column']} ({payload['candidate_table']})")
+                st.markdown(f"**후보 설명**: {payload['candidate_description']}")
             approve_label, reject_label = "✅ 승인", "❌ 거절"
+
         elif payload["type"] == "type_mismatch_confirmation":
             st.markdown(f"**컬럼**: {payload['column_id']} (테이블: {payload['table']})")
             st.markdown(f"**명세 type**: {payload['spec_type']}")
             st.markdown(f"**실제 type**: {payload['actual_type']}")
             approve_label, reject_label = "✅ 실제 DB 기준으로 갱신", "❌ 명세 기준 유지"
+
+        elif payload["type"] == "header_mapping_confirmation":
+            st.markdown(f"**표준 필드 \"{payload['missing_std_field']}\"에 해당하는 컬럼을 찾지 못했습니다**")
+            st.caption("규칙 매칭과 LLM 판단을 모두 시도했지만 확신도가 기준 미달이었습니다. "
+                        "업로드된 원본 헤더에서 직접 골라주세요.")
+
+            st.markdown("**시도 내역**")
+            for a in payload["attempts"]:
+                st.markdown(f"- **{a['method']}**: {a['detail']}")
+
+            st.markdown("**원본 헤더**")
+            headers = payload["all_headers"]
+            cols = st.columns(len(headers))
+            for col, h in zip(cols, headers):
+                with col:
+                    st.markdown(f"**{h['name']}**")
+                    st.caption(h["sample"] or "-")
+                    if h["mapped_to"]:
+                        st.caption(f"✅ {h['mapped_to']}")
+
+            unmapped_names = [h["name"] for h in headers if not h["mapped_to"]]
+            suggested = payload.get("suggested_column")
+            default_idx = unmapped_names.index(suggested) if suggested in unmapped_names else 0
+
+            selected_header = st.radio(
+                "매핑할 헤더 선택",
+                unmapped_names,
+                index=default_idx,
+                horizontal=True,
+                key=f"header_select_{thread_id}_{payload['missing_std_field']}",
+            )
+            approve_label, reject_label = "이 매핑으로 확정", "해당 필드 없음"
+
         else:
             st.json(payload)
             approve_label, reject_label = "✅ 승인", "❌ 거절"
 
         c1, c2 = st.columns(2)
         if c1.button(approve_label, type="primary", use_container_width=True):
-            api_client.confirm(thread_id, "approved")
+            if payload["type"] == "header_mapping_confirmation":
+                api_client.confirm(thread_id, {"decision": "approved", "selected_column": selected_header})
+            else:
+                api_client.confirm(thread_id, "approved")
             st.rerun()
         if c2.button(reject_label, use_container_width=True):
-            api_client.confirm(thread_id, "rejected")
+            if payload["type"] == "header_mapping_confirmation":
+                api_client.confirm(thread_id, {"decision": "rejected"})
+            else:
+                api_client.confirm(thread_id, "rejected")
             st.rerun()
 
 st.divider()

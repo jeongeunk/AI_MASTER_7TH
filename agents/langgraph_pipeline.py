@@ -331,3 +331,7 @@ def get_compiled_graph():
     graph = build_graph()
     conn_cm = SqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
     return graph, conn_cm
+
+def parsing_node(state: PipelineState) -> dict:
+    result = run_parsing(state["input_file"], confirm_fn=graph_confirm_fn)  # confirm_fn 인자 추가
+    return {"parsed_rows": result["parsed_rows"]}
