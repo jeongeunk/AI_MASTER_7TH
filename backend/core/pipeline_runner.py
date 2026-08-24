@@ -39,7 +39,7 @@ def _json_safe(value):
 
 # ── 노드별 tool/LLM 메타데이터 (모니터링 화면 표시용) ─────────────
 NODE_METADATA = {
-    "parsing": {"label": "명세서 파싱", "tool": "parse_excel_to_df / map_columns_by_header / validate_row_schema", "model": None},
+    "parsing": {"label": "명세서 파싱", "tool": "parse_excel_to_df / map_columns_by_header / map_columns_with_llm / validate_row_schema", "model": "gpt-4.1-mini (헤더 매핑 폴백)"},
     "meta_init": {"label": "Meta Search 준비", "tool": "상태 초기화", "model": None},
     "meta_exact_check": {"label": "정확 매칭 확인", "tool": "exact_match_meta_db", "model": None},
     "meta_retrieve": {"label": "다중소스 후보 검색", "tool": "retrieve_candidates (vss column + vss glossary + fuzzy)", "model": "text-embedding-3-large"},

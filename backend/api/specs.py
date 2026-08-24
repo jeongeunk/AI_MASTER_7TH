@@ -32,7 +32,10 @@ async def upload_spec(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
 
     try:
-        result = run_parsing(save_path)
+        # 미리보기는 담당자 확인(interrupt) 없이 동기로 응답해야 하므로,
+        # 규칙+LLM 매핑에도 실패한 필드는 바로 거절 처리해 422로 보고한다.
+        # (실제 담당자 확인 UI는 /api/pipeline/start 이후 모니터링 화면에서 처리)
+        result = run_parsing(save_path, confirm_fn=lambda payload: {"decision": "rejected"})
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=f"파싱 실패: {e}")
 
