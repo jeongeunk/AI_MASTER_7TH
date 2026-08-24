@@ -1,15 +1,16 @@
 """
 frontend/pages/2_모니터링.py
 
-파이프라인 진행 상황(어떤 tool/LLM을 쓰고 있는지) 실시간 확인 + 담당자 확인(HITL) 승인/거절
-- inferred_confirmation, type_mismatch_confirmation: 기존 승인/거절 화면
-- header_mapping_confirmation: Parsing Agent가 규칙+LLM 매핑에 모두 실패했을 때,
-  원본 헤더를 가로로 나열하고 아직 안 정해진 헤더만 라디오로 고를 수 있게 함
-- row_completion_confirmation (신규): 영문명/한글명/항목설명 중 일부만 있는 행을
-  메타DB(우선)/LLM(폴백)이 보완한 제안을, 파싱이 모두 끝난 뒤 표로 한 번에 승인/거절
+Agent 실행 모니터링: 각 Agent(노드)의 시작/종료 시각·소요시간, tool 호출 내역
+(어떤 tool이 불렸는지·소요시간·LLM이면 어떤 모델인지)을 전부 확인할 수 있게 구성.
+- '업로드' 페이지의 '업로드 및 파싱' 단계(Parsing Agent, 동기 호출)와
+  파이프라인 시작 이후의 5-Agent 그래프 실행을 모두 여기서 확인한다.
+- 담당자 확인(HITL): inferred_confirmation, type_mismatch_confirmation,
+  header_mapping_confirmation, row_completion_confirmation 승인/거절
 """
 
 import time
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -19,11 +20,66 @@ from api_client import api_client
 st.set_page_config(page_title="모니터링 - SchemaScout", page_icon="🔍", layout="wide")
 st.title("2. 모니터링")
 
+LEVEL_BADGE = {
+    "plan": "📋 PLAN",
+    "decision": "🧠 DECISION",
+    "self_correction": "🔁 SELF-CORRECTION",
+    "human": "🙋 HUMAN-IN-THE-LOOP",
+    "step": "⚙️ STEP",
+}
+
+
+def _fmt_time(ts) -> str:
+    if ts is None:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _render_tool_calls(tool_calls: list):
+    if not tool_calls:
+        st.caption("이 구간에서 호출된 tool이 없습니다.")
+        return
+    rows = [
+        {
+            "tool": t["tool"],
+            "model": t.get("model") or "-",
+            "시작": _fmt_time(t["start"]),
+            "종료": _fmt_time(t["end"]),
+            "소요시간(s)": t["duration_sec"],
+        }
+        for t in tool_calls
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def _render_agent_trace_card(trace: dict):
+    """Agent 시작/종료/소요시간 + 그 안에서 호출된 tool 목록(모델 포함)을 카드 형태로 표시."""
+    if not trace:
+        st.caption("이 Agent에 대한 트레이스 정보가 없습니다.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("시작", _fmt_time(trace.get("agent_start")))
+    c2.metric("종료", _fmt_time(trace.get("agent_end")))
+    c3.metric("소요시간", f"{trace.get('agent_duration_sec', 0)}s")
+    st.markdown(f"**tool 호출 내역** ({len(trace.get('tool_calls', []))}건)")
+    _render_tool_calls(trace.get("tool_calls", []))
+
+
+# ── 업로드/파싱 단계(동기 호출) 트레이스 ────────────────────────
+upload_trace = st.session_state.get("upload_trace")
+if upload_trace:
+    st.subheader("📤 업로드 · 파싱 단계 — Parsing Agent")
+    with st.container(border=True):
+        _render_agent_trace_card(upload_trace)
+    st.divider()
+
 thread_id = st.session_state.get("thread_id")
 if not thread_id:
-    st.warning("진행 중인 파이프라인이 없습니다. '업로드' 페이지에서 먼저 시작하세요.")
+    if not upload_trace:
+        st.warning("진행 중인 파이프라인이 없습니다. '업로드' 페이지에서 먼저 시작하세요.")
     st.stop()
 
+st.subheader("🔄 파이프라인 실행 — 5-Agent 그래프")
 st.caption(f"thread_id: `{thread_id}`")
 
 if st.session_state.get("events_thread_id") != thread_id:
@@ -183,11 +239,26 @@ if status == "waiting_human" and snapshot["confirm_payload"]:
                 st.rerun()
 
 st.divider()
-st.subheader("진행 로그")
+st.subheader("진행 로그 — Agent별 시작/종료/소요시간 + tool 호출 내역")
 for ev in reversed(st.session_state["events"]):
-    with st.expander(f"[{ev['seq']}] {ev['label']} — {ev['summary']} ({ev['elapsed_sec']}s)"):
-        st.markdown(f"- **tool**: {ev['tool']}")
-        st.markdown(f"- **model**: {ev['model'] or '해당 없음'}")
+    badge = LEVEL_BADGE.get(ev.get("level", "step"), "⚙️ STEP")
+    n_tools = len(ev.get("tool_calls") or [])
+    header = (
+        f"{badge} · [{ev['seq']}] {ev['label']} — {ev['summary']} "
+        f"({ev.get('agent_duration_sec', ev['elapsed_sec'])}s, tool {n_tools}건)"
+    )
+    with st.expander(header):
+        if ev.get("agent_start") is not None:
+            _render_agent_trace_card({
+                "agent_start": ev.get("agent_start"),
+                "agent_end": ev.get("agent_end"),
+                "agent_duration_sec": ev.get("agent_duration_sec"),
+                "tool_calls": ev.get("tool_calls") or [],
+            })
+        else:
+            # 트레이스 정보가 없는(구버전) 이벤트에 대한 폴백 표시
+            st.markdown(f"- **tool**: {ev['tool']}")
+            st.markdown(f"- **model**: {ev['model'] or '해당 없음'}")
 
 if status == "done":
     st.success("파이프라인이 완료되었습니다. 왼쪽 사이드바에서 '결과 및 다운로드' 페이지로 이동하세요.")

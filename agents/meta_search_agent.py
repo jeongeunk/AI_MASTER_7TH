@@ -19,11 +19,15 @@ Meta Search Agent (RAG 전환판)
 """
 
 import os
+import sys
 import json
 import sqlite3
 import duckdb
 from dotenv import load_dotenv
 from rapidfuzz import process as fuzz_process, fuzz
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agents.trace import tool_span, instrument_agent
 
 load_dotenv()
 
@@ -39,11 +43,12 @@ MAX_RETRIEVAL_ATTEMPTS = 2          # 재검색 최대 횟수
 
 # ── Tool: exact_match_meta_db ──────────────────────────────
 def exact_match_meta_db(con, eng_name: str) -> dict:
-    row = con.execute(
-        "SELECT column_id, table_id, column_name, data_type, description "
-        "FROM column_spec WHERE column_name = ?",
-        [eng_name],
-    ).fetchone()
+    with tool_span("exact_match_meta_db"):
+        row = con.execute(
+            "SELECT column_id, table_id, column_name, data_type, description "
+            "FROM column_spec WHERE column_name = ?",
+            [eng_name],
+        ).fetchone()
     if row:
         return {"found": True, "meta_row": {
             "column_id": row[0], "table_id": row[1],
@@ -88,7 +93,8 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     문자열 유사도(fuzzy)를 병합해 후보 top_k를 반환한다.
     각 후보: {column_id, source: 'vss_column'|'vss_glossary'|'fuzzy', score, meta_row}
     """
-    resp = embed_fn("DEPLOYMENT_EMBED_LARGE", description)
+    with tool_span("embed (retrieve_candidates)", model="text-embedding-3-large"):
+        resp = embed_fn("DEPLOYMENT_EMBED_LARGE", description)
     query_vec = resp.data[0].embedding
 
     merged = {}  # column_id -> candidate dict (가장 점수 높은 것 유지)
@@ -101,17 +107,18 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
             merged[column_id] = {"column_id": column_id, "source": source, "score": round(score, 4), "meta_row": meta_row}
 
     # 1) 컬럼 설명 임베딩 유사도
-    col_rows = con.execute(
-        """
-        SELECT cs.column_id, cs.table_id, cs.column_name, cs.data_type, cs.description,
-               array_cosine_distance(ce.embedding, ?::FLOAT[3072]) AS distance
-        FROM column_embeddings ce
-        JOIN column_spec cs ON ce.column_id = cs.column_id
-        ORDER BY distance ASC
-        LIMIT ?
-        """,
-        [query_vec, max(top_k * 2, 5)],
-    ).fetchall()
+    with tool_span("vss_search (column_embeddings)"):
+        col_rows = con.execute(
+            """
+            SELECT cs.column_id, cs.table_id, cs.column_name, cs.data_type, cs.description,
+                   array_cosine_distance(ce.embedding, ?::FLOAT[3072]) AS distance
+            FROM column_embeddings ce
+            JOIN column_spec cs ON ce.column_id = cs.column_id
+            ORDER BY distance ASC
+            LIMIT ?
+            """,
+            [query_vec, max(top_k * 2, 5)],
+        ).fetchall()
     for r in col_rows:
         similarity = 1 - r[5]
         meta_row = {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
@@ -120,18 +127,19 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     # 2) 도메인 용어집(glossary) 임베딩 유사도 — linked_column_id가 있는 것만 후보로 승격
     glossary_floor = (floor - 0.15) if include_glossary_boost else floor
     try:
-        gloss_rows = con.execute(
-            """
-            SELECT gt.linked_column_id, gt.canonical_term,
-                   array_cosine_distance(ge.embedding, ?::FLOAT[3072]) AS distance
-            FROM glossary_embeddings ge
-            JOIN glossary_terms gt ON ge.term_id = gt.term_id
-            WHERE gt.linked_column_id IS NOT NULL
-            ORDER BY distance ASC
-            LIMIT ?
-            """,
-            [query_vec, max(top_k * 2, 5)],
-        ).fetchall()
+        with tool_span("vss_search (glossary_embeddings)"):
+            gloss_rows = con.execute(
+                """
+                SELECT gt.linked_column_id, gt.canonical_term,
+                       array_cosine_distance(ge.embedding, ?::FLOAT[3072]) AS distance
+                FROM glossary_embeddings ge
+                JOIN glossary_terms gt ON ge.term_id = gt.term_id
+                WHERE gt.linked_column_id IS NOT NULL
+                ORDER BY distance ASC
+                LIMIT ?
+                """,
+                [query_vec, max(top_k * 2, 5)],
+            ).fetchall()
         for r in gloss_rows:
             similarity = 1 - r[2]
             if similarity < glossary_floor:
@@ -149,8 +157,10 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
         pass
 
     # 3) 문자열 유사도 (오탈자·표기 변형)
-    all_columns = _fetch_all_columns(con)
-    for fm in fuzzy_match_candidates(eng_name, all_columns, top_k=top_k):
+    with tool_span("fuzzy_match_candidates"):
+        all_columns = _fetch_all_columns(con)
+        fuzzy_results = fuzzy_match_candidates(eng_name, all_columns, top_k=top_k)
+    for fm in fuzzy_results:
         cid = fm["column_id"]
         if cid in merged:
             continue  # vss가 이미 더 강한 근거로 잡았으면 fuzzy로 덮어쓰지 않음
@@ -208,15 +218,16 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
         ],
     }
 
-    resp = chat_fn(
-        "DEPLOYMENT_GPT5_MINI",
-        [
-            {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
+    with tool_span("generate_match_judgment", model="gpt-5-mini"):
+        resp = chat_fn(
+            "DEPLOYMENT_GPT5_MINI",
+            [
+                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
     text = resp.choices[0].message.content.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -316,10 +327,11 @@ def apply_confirmation_result(decision: str) -> dict:
 
 # ── Tool: update_meta_tag (Classification Agent와 공유) ────
 def update_meta_tag(con, column_id: str, tag: str, confidence: float = None):
-    con.execute(
-        "UPDATE column_spec SET tag = ?, confidence = ?, updated_at = current_timestamp WHERE column_id = ?",
-        [tag, confidence, column_id],
-    )
+    with tool_span("update_meta_tag"):
+        con.execute(
+            "UPDATE column_spec SET tag = ?, confidence = ?, updated_at = current_timestamp WHERE column_id = ?",
+            [tag, confidence, column_id],
+        )
 
 
 # ── Tool: log_auto_confirm (신규, 자동 확정 전량 감사 기록) ─
@@ -366,11 +378,12 @@ def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_
 
 # ── Tool: get_table_relationships ──────────────────────────
 def get_table_relationships(con, table_id: str) -> list:
-    rows = con.execute(
-        "SELECT from_table_id, to_table_id, join_key, relation_type "
-        "FROM table_relationships WHERE from_table_id = ? OR to_table_id = ?",
-        [table_id, table_id],
-    ).fetchall()
+    with tool_span("get_table_relationships"):
+        rows = con.execute(
+            "SELECT from_table_id, to_table_id, join_key, relation_type "
+            "FROM table_relationships WHERE from_table_id = ? OR to_table_id = ?",
+            [table_id, table_id],
+        ).fetchall()
     return [
         {"source_table": r[0], "target_table": r[1], "join_key": r[2], "relation_type": r[3]}
         for r in rows

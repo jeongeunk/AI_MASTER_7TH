@@ -48,6 +48,7 @@ from agents.meta_search_agent import (
 from agents.db_validation_agent import run_db_validation
 from agents.classification_agent import run_classification
 from agents.report_agent import run_report
+from agents.trace import instrument_agent
 from llm_client import embed, chat
 
 load_dotenv()
@@ -78,6 +79,8 @@ class PipelineState(TypedDict, total=False):
     report_excel_path: Optional[str]
     report_stats: Optional[dict]
 
+    trace_log: Optional[dict]  # 노드 실행의 tool-call 트레이스(pipeline_runner가 읽어 모니터링에 표시)
+
 
 # ── interrupt() 기반 confirm_fn ────────────────────────────
 def graph_confirm_fn(payload: dict) -> str:
@@ -100,11 +103,13 @@ def _enrich(con, result: dict) -> dict:
 
 
 # ── 노드 정의: Parsing ───────────────────────────────────────
+@instrument_agent("Parsing Agent")
 def parsing_node(state: PipelineState) -> dict:
     result = run_parsing(state["input_file"], confirm_fn=graph_confirm_fn)
     return {"parsed_rows": result["parsed_rows"]}
 
 
+@instrument_agent("Meta Search Agent (서브플랜 초기화)")
 def meta_init_node(state: PipelineState) -> dict:
     return {
         "meta_columns": state["parsed_rows"],
@@ -114,6 +119,7 @@ def meta_init_node(state: PipelineState) -> dict:
 
 
 # ── 노드 정의: Meta Search 서브플로우 ────────────────────────
+@instrument_agent("Meta Search Agent (exact check)")
 def meta_exact_check_node(state: PipelineState) -> dict:
     columns = state["meta_columns"]
     idx = state["meta_index"]
@@ -152,6 +158,7 @@ def route_after_exact(state: PipelineState) -> str:
     return "search"
 
 
+@instrument_agent("Meta Search Agent (retrieve)")
 def meta_retrieve_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     con = _get_meta_con()
@@ -168,6 +175,7 @@ def route_after_retrieve(state: PipelineState) -> str:
     return "judge" if state["current_candidates"] else "no_candidates"
 
 
+@instrument_agent("Meta Search Agent (no match)")
 def meta_no_match_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     out = {**col, "match_status": "unresolved", "meta_row": None,
@@ -179,6 +187,7 @@ def meta_no_match_node(state: PipelineState) -> dict:
     }
 
 
+@instrument_agent("Meta Search Agent (LLM judge)")
 def meta_judge_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     judgment = generate_match_judgment(col, state["current_candidates"], chat_fn=chat)
@@ -189,6 +198,7 @@ def route_by_judgment(state: PipelineState) -> str:
     return decide_route(state["current_judgment"], state["retrieval_attempts"])
 
 
+@instrument_agent("Meta Search Agent (auto confirm)")
 def meta_auto_confirm_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     judgment = state["current_judgment"]
@@ -209,6 +219,7 @@ def meta_auto_confirm_node(state: PipelineState) -> dict:
     }
 
 
+@instrument_agent("Meta Search Agent (self-correction retry)")
 def meta_retry_node(state: PipelineState) -> dict:
     attempts = state["retrieval_attempts"] + 1
     params = expand_retrieval_params(attempts)
@@ -220,6 +231,7 @@ def meta_retry_node(state: PipelineState) -> dict:
     }
 
 
+@instrument_agent("Meta Search Agent (human confirm)")
 def meta_human_confirm_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     judgment = state["current_judgment"]
@@ -263,16 +275,19 @@ def route_after_resolution(state: PipelineState) -> str:
 
 
 # ── 노드 정의: 이후 단계 (기존과 동일) ─────────────────────────
+@instrument_agent("DB Validation Agent")
 def db_validation_node(state: PipelineState) -> dict:
     results = run_db_validation(state["meta_results"], confirm_fn=graph_confirm_fn)
     return {"validation_results": results}
 
 
+@instrument_agent("Classification Agent")
 def classification_node(state: PipelineState) -> dict:
     results = run_classification(state["validation_results"])
     return {"classified_results": results}
 
 
+@instrument_agent("Report Agent")
 def report_node(state: PipelineState) -> dict:
     result = run_report(state["meta_results"], state["classified_results"], input_file_path=state["input_file"])
     return {"report_excel_path": result["excel_path"], "report_stats": result["stats"]}

@@ -15,6 +15,7 @@ import sqlite3
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agents.trace import tool_span, instrument_agent
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -115,27 +116,28 @@ def _compute_tag_label(row) -> str:
 
 # ── Tool: generate_excel_report ────────────────────────────
 def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_명세서.xlsx"):
-    df = merged_df.copy()
-    df["태그설명"] = df.apply(_compute_tag_label, axis=1)
-    df["처리경로"] = df["resolution_path"].map(RESOLUTION_PATH_LABEL).fillna(df["resolution_path"])
+    with tool_span("generate_excel_report (xlsxwriter)"):
+        df = merged_df.copy()
+        df["태그설명"] = df.apply(_compute_tag_label, axis=1)
+        df["처리경로"] = df["resolution_path"].map(RESOLUTION_PATH_LABEL).fillna(df["resolution_path"])
 
-    ordered_cols = [
-        "영문명", "한글명",
-        "요청 type", "제공가능 type",
-        "요청시점(기간)", "제공가능시점(기간)",
-        "항목설명", "소속테이블",
-        "최종태그", "태그설명", "처리경로", "근거",
-    ]
-    df = df[ordered_cols]
+        ordered_cols = [
+            "영문명", "한글명",
+            "요청 type", "제공가능 type",
+            "요청시점(기간)", "제공가능시점(기간)",
+            "항목설명", "소속테이블",
+            "최종태그", "태그설명", "처리경로", "근거",
+        ]
+        df = df[ordered_cols]
 
-    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="명세서 검증 결과")
-        workbook = writer.book
-        worksheet = writer.sheets["명세서 검증 결과"]
-        header_fmt = workbook.add_format({"bold": True, "bg_color": "#EEEDFE", "border": 1})
-        for col_idx, col_name in enumerate(df.columns):
-            worksheet.write(0, col_idx, col_name, header_fmt)
-            worksheet.set_column(col_idx, col_idx, max(14, len(col_name) + 4))
+        with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="명세서 검증 결과")
+            workbook = writer.book
+            worksheet = writer.sheets["명세서 검증 결과"]
+            header_fmt = workbook.add_format({"bold": True, "bg_color": "#EEEDFE", "border": 1})
+            for col_idx, col_name in enumerate(df.columns):
+                worksheet.write(0, col_idx, col_name, header_fmt)
+                worksheet.set_column(col_idx, col_idx, max(14, len(col_name) + 4))
 
     return output_path
 
@@ -164,22 +166,25 @@ def log_revision_snapshot(column_id: str, before_tag: str, after_tag: str, reaso
 
 
 # ── 오케스트레이션 ───────────────────────────────────────────
+@instrument_agent("Report Agent")
 def run_report(meta_results: list, classified_results: list, input_file_path: str = None, output_path: str = None) -> dict:
     if output_path is None:
         output_path = _build_output_filename(input_file_path)
 
-    merged_df = aggregate_results(meta_results, classified_results)
+    with tool_span("aggregate_results"):
+        merged_df = aggregate_results(meta_results, classified_results)
     excel_path = generate_excel_report(merged_df, output_path)
     stats = compute_summary_stats(merged_df)
 
     # 처리 완료 스냅샷 기록
-    for _, row in merged_df.iterrows():
-        log_revision_snapshot(
-            column_id=row["영문명"],
-            before_tag=None,
-            after_tag=row["최종태그"],
-            reason=f"resolution_path={row['resolution_path']}",
-        )
+    with tool_span(f"log_revision_snapshot ({len(merged_df)}건)"):
+        for _, row in merged_df.iterrows():
+            log_revision_snapshot(
+                column_id=row["영문명"],
+                before_tag=None,
+                after_tag=row["최종태그"],
+                reason=f"resolution_path={row['resolution_path']}",
+            )
 
     return {"excel_path": excel_path, "stats": stats}
 

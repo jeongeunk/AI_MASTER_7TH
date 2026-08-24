@@ -14,11 +14,15 @@ Guardrail:
 """
 
 import os
+import sys
 import sqlite3
 import duckdb
 import sqlglot
 from datetime import datetime
 from dotenv import load_dotenv
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agents.trace import tool_span
 
 load_dotenv()
 
@@ -71,29 +75,32 @@ def validate_query_structure(raw_query: str) -> dict:
 
 # ── Tool: check_column_exists ──────────────────────────────
 def check_column_exists(con, table: str, column: str) -> dict:
-    row = con.execute(
-        "SELECT COUNT(*) FROM duckdb_columns() "
-        "WHERE database_name = 'data_db' AND table_name = ? AND column_name = ?",
-        [table, column],
-    ).fetchone()
+    with tool_span("check_column_exists"):
+        row = con.execute(
+            "SELECT COUNT(*) FROM duckdb_columns() "
+            "WHERE database_name = 'data_db' AND table_name = ? AND column_name = ?",
+            [table, column],
+        ).fetchone()
     return {"exists": row[0] > 0}
 
 
 # ── Tool: fetch_spec_type ──────────────────────────────────
 def fetch_spec_type(con, column_id: str) -> str:
-    row = con.execute(
-        "SELECT data_type FROM column_spec WHERE column_id = ?", [column_id]
-    ).fetchone()
+    with tool_span("fetch_spec_type"):
+        row = con.execute(
+            "SELECT data_type FROM column_spec WHERE column_id = ?", [column_id]
+        ).fetchone()
     return row[0] if row else None
 
 
 # ── Tool: query_column_type ────────────────────────────────
 def query_column_type(con, table: str, column: str) -> str:
-    row = con.execute(
-        "SELECT data_type FROM duckdb_columns() "
-        "WHERE database_name = 'data_db' AND table_name = ? AND column_name = ?",
-        [table, column],
-    ).fetchone()
+    with tool_span("query_column_type"):
+        row = con.execute(
+            "SELECT data_type FROM duckdb_columns() "
+            "WHERE database_name = 'data_db' AND table_name = ? AND column_name = ?",
+            [table, column],
+        ).fetchone()
     return row[0] if row else None
 
 
@@ -163,15 +170,16 @@ def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_
 
 # ── Tool: query_retention_period ───────────────────────────
 def query_retention_period(con, table: str, column: str) -> dict:
-    has_month = con.execute(
-        "SELECT COUNT(*) FROM duckdb_columns() "
-        "WHERE database_name = 'data_db' AND table_name = ? AND column_name = 'month'",
-        [table],
-    ).fetchone()[0]
-    if not has_month:
-        return {"start": None, "end": None}
+    with tool_span("query_retention_period"):
+        has_month = con.execute(
+            "SELECT COUNT(*) FROM duckdb_columns() "
+            "WHERE database_name = 'data_db' AND table_name = ? AND column_name = 'month'",
+            [table],
+        ).fetchone()[0]
+        if not has_month:
+            return {"start": None, "end": None}
 
-    row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{table}").fetchone()
+        row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{table}").fetchone()
     return {"start": row[0], "end": row[1]}
 
 

@@ -47,4 +47,5 @@ async def upload_spec(file: UploadFile = File(...)):
         "fail_count": len(result["failed_rows"]),
         "failed_rows": result["failed_rows"][:20],  # 실패 사유 확인용 (최대 20건만)
         "preview": result["parsed_rows"][:10],  # 미리보기는 10건만
+        "trace": result.get("trace_log"),  # 모니터링 화면 표시용: 시작/종료/소요시간 + tool 호출 내역
     }
