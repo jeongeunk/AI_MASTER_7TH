@@ -17,7 +17,7 @@ from agents.parsing_agent import run_parsing
 
 router = APIRouter()
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./data/uploads")
+UPLOAD_DIR = os.path.abspath(os.environ.get("UPLOAD_DIR", "./data/uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
@@ -26,8 +26,20 @@ async def upload_spec(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="xlsx 파일만 업로드할 수 있습니다.")
 
+    # 보안: file.filename은 클라이언트가 완전히 제어하는 값이라 "../"나 절대경로가
+    # 섞여 들어오면 os.path.join()이 UPLOAD_DIR 밖 경로로 튈 수 있다(경로 조작).
+    # os.path.basename으로 디렉터리 구성요소를 전부 제거해 파일명만 남긴다.
+    safe_filename = os.path.basename(file.filename)
+    if not safe_filename or not safe_filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="유효하지 않은 파일명입니다.")
+
     upload_id = str(uuid.uuid4())
-    save_path = os.path.join(UPLOAD_DIR, f"{upload_id}_{file.filename}")
+    save_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"{upload_id}_{safe_filename}"))
+
+    # 이중 방어: 정제 후에도 결과 경로가 UPLOAD_DIR 하위인지 최종 확인.
+    if os.path.commonpath([save_path, UPLOAD_DIR]) != UPLOAD_DIR:
+        raise HTTPException(status_code=400, detail="유효하지 않은 파일 경로입니다.")
+
     with open(save_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 

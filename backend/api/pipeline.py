@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from backend.api.specs import UPLOAD_DIR
 from backend.core.pipeline_runner import (
     start_pipeline,
     get_events_since,
@@ -28,6 +29,18 @@ from backend.core.pipeline_runner import (
 )
 
 router = APIRouter()
+
+
+def _validate_file_path(file_path: str) -> str:
+    """
+    보안: file_path를 클라이언트가 임의 문자열로 지정할 수 있으므로,
+    /api/specs/upload를 거치지 않고 서버 파일시스템의 아무 경로나 실행시키는
+    것을 막기 위해 UPLOAD_DIR 하위 경로만 허용한다.
+    """
+    abs_path = os.path.abspath(file_path)
+    if os.path.commonpath([abs_path, UPLOAD_DIR]) != UPLOAD_DIR:
+        raise HTTPException(status_code=400, detail="file_path는 업로드 디렉터리 하위 경로여야 합니다.")
+    return abs_path
 
 
 class StartRequest(BaseModel):
@@ -55,9 +68,10 @@ def _validate_decision(decision: Union[str, dict]) -> None:
 
 @router.post("/pipeline/start")
 def start(req: StartRequest):
-    if not os.path.exists(req.file_path):
+    safe_path = _validate_file_path(req.file_path)
+    if not os.path.exists(safe_path):
         raise HTTPException(status_code=404, detail="업로드된 파일을 찾을 수 없습니다.")
-    thread_id = start_pipeline(req.file_path)
+    thread_id = start_pipeline(safe_path)
     return {"thread_id": thread_id}
 
 

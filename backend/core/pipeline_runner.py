@@ -41,24 +41,26 @@ def _json_safe(value):
 # level: "plan"(전체 계획 선언) | "decision"(분기 판단) | "self_correction"(재시도/보정)
 #        | "human"(담당자 개입) | "step"(일반 실행 단계)
 NODE_METADATA = {
-    "parsing": {"label": "명세서 파싱", "tool": "parse_excel_to_df / map_columns_by_header / map_columns_with_llm / validate_row_schema", "model": "gpt-4.1-mini (헤더 매핑 폴백)", "level": "step", "plan_step": "1/5"},
-    "meta_init": {"label": "Meta Search 준비", "tool": "상태 초기화", "model": None, "level": "plan", "plan_step": "2/5"},
-    "meta_exact_check": {"label": "정확 매칭 확인", "tool": "exact_match_meta_db", "model": None, "level": "step", "plan_step": "2/5"},
-    "meta_retrieve": {"label": "다중소스 후보 검색", "tool": "retrieve_candidates (vss column + vss glossary + fuzzy)", "model": "text-embedding-3-large", "level": "step", "plan_step": "2/5"},
-    "meta_no_match": {"label": "매칭 후보 없음 처리", "tool": "unresolved(no_match) 기록", "model": None, "level": "step", "plan_step": "2/5"},
-    "meta_judge": {"label": "AI 매칭 판단", "tool": "generate_match_judgment", "model": "gpt-5-mini", "level": "decision", "plan_step": "2/5"},
-    "meta_auto_confirm": {"label": "자동 확정", "tool": "update_meta_tag / log_auto_confirm", "model": None, "level": "step", "plan_step": "2/5"},
-    "meta_retry": {"label": "재검색 준비", "tool": "expand_retrieval_params", "model": None, "level": "self_correction", "plan_step": "2/5"},
-    "meta_human_confirm": {"label": "담당자 확인 대기", "tool": "request_inferred_confirmation (interrupt)", "model": None, "level": "human", "plan_step": "2/5"},
-    "db_validation": {"label": "실 DB 검증", "tool": "check_column_exists / query_column_type / query_retention_period", "model": None, "level": "step", "plan_step": "3/5"},
-    "classification": {"label": "최종 태깅", "tool": "classify_existence / tag_from_type_status / compare_period", "model": None, "level": "step", "plan_step": "4/5"},
-    "report": {"label": "명세서 생성", "tool": "aggregate_results / generate_excel_report", "model": "gpt-4.1 (근거 문구 다듬기, 선택적)", "level": "step", "plan_step": "5/5"},
+    "parsing": {"label": "명세서 파싱", "tool": "parse_excel_to_df / map_columns_by_header / map_columns_with_llm / validate_row_schema", "model": "gpt-4.1-mini (헤더 매핑 폴백)", "level": "step", "plan_step": "1/6"},
+    "meta_init": {"label": "Meta Search 준비", "tool": "상태 초기화", "model": None, "level": "plan", "plan_step": "2/6"},
+    "meta_exact_check": {"label": "정확 매칭 확인", "tool": "exact_match_meta_db", "model": None, "level": "step", "plan_step": "2/6"},
+    "meta_retrieve": {"label": "다중소스 후보 검색", "tool": "retrieve_candidates (vss column + vss glossary + fuzzy)", "model": "text-embedding-3-large", "level": "step", "plan_step": "2/6"},
+    "meta_no_match": {"label": "매칭 후보 없음 처리", "tool": "unresolved(no_match) 기록", "model": None, "level": "step", "plan_step": "2/6"},
+    "meta_judge": {"label": "AI 매칭 판단", "tool": "generate_match_judgment", "model": "gpt-5-mini", "level": "decision", "plan_step": "2/6"},
+    "meta_auto_confirm": {"label": "자동 확정", "tool": "update_meta_tag / log_auto_confirm", "model": None, "level": "step", "plan_step": "2/6"},
+    "meta_retry": {"label": "재검색 준비", "tool": "expand_retrieval_params", "model": None, "level": "self_correction", "plan_step": "2/6"},
+    "meta_human_confirm": {"label": "담당자 확인 대기", "tool": "request_inferred_confirmation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
+    "meta_table_disambiguation": {"label": "테이블 선택 대기", "tool": "request_table_disambiguation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
+    "join_resolution": {"label": "조인 가능성 검증", "tool": "find_join_path / generate_join_key_candidates / check_value_overlap", "model": None, "level": "step", "plan_step": "3/6"},
+    "db_validation": {"label": "실 DB 검증", "tool": "check_column_exists / query_column_type / query_retention_period", "model": None, "level": "step", "plan_step": "4/6"},
+    "classification": {"label": "최종 태깅", "tool": "classify_existence / tag_from_type_status / compare_period", "model": None, "level": "step", "plan_step": "5/6"},
+    "report": {"label": "명세서 생성", "tool": "aggregate_results / generate_excel_report", "model": "gpt-4.1 (근거 문구 다듬기, 선택적)", "level": "step", "plan_step": "6/6"},
 }
 
 PLAN_ANNOUNCEMENT = (
-    "Planning: 5-step plan generated "
+    "Planning: 6-step plan generated "
     "(1 Parsing → 2 Meta Search[exact→retrieve→judge→auto/retry/human] → "
-    "3 DB Validation → 4 Classification → 5 Report). Simulating plan..."
+    "3 Join Resolution → 4 DB Validation → 5 Classification → 6 Report). Simulating plan..."
 )
 
 
@@ -69,15 +71,18 @@ def _summarize_update(node_name: str, update: dict) -> str:
     실행했는지'를 서술한다."""
     if node_name == "parsing":
         n = len(update.get("parsed_rows", []))
-        return f"Step 1/5 실행 — 규칙 매칭 우선 시도 → 실패 필드만 LLM 폴백 → 그래도 실패 시 담당자 확인. 결과: {n}건 파싱 완료"
+        return f"Step 1/6 실행 — 규칙 매칭 우선 시도 → 실패 필드만 LLM 폴백 → 그래도 실패 시 담당자 확인. 결과: {n}건 파싱 완료"
     if node_name == "meta_init":
-        return f"Step 2/5 서브플랜 초기화 — {len(update.get('meta_columns', []))}개 컬럼에 대해 exact→retrieve→judge 상태 기계 순회 시작"
+        return f"Step 2/6 서브플랜 초기화 — {len(update.get('meta_columns', []))}개 컬럼에 대해 exact→retrieve→judge 상태 기계 순회 시작"
     if node_name == "meta_exact_check":
         ef = update.get("exact_found")
         if ef is True:
             return "정확 매칭 성공 → 후보 검색 단계 스킵(비용 절감)"
         if ef == "empty":
             return "처리할 컬럼 없음 → 서브플랜 종료, 다음 단계로"
+        if ef == "ambiguous":
+            n = len(update.get("exact_candidates", []))
+            return f"정확 매칭됐지만 동일 컬럼명이 테이블 {n}개에 존재 → 자동 확정하지 않고 담당자에게 테이블 선택 위임(interrupt)"
         return "정확 매칭 실패 → 의미 기반 후보 검색으로 분기"
     if node_name == "meta_retrieve":
         return f"다중소스 검색(vss_column + vss_glossary + fuzzy) 실행 → 후보 {len(update.get('current_candidates', []))}건 확보"
@@ -96,12 +101,28 @@ def _summarize_update(node_name: str, update: dict) -> str:
         return "검색 후보 없음 → unresolved 처리, DB Validation/Classification 스킵"
     if node_name == "meta_human_confirm":
         return "확신도 애매(0.70~0.92) → 자동 판단을 유보하고 담당자 확인으로 위임(interrupt)"
+    if node_name == "meta_table_disambiguation":
+        m = update.get("meta_results", [])
+        last = m[-1] if m else {}
+        return f"담당자 선택 반영 — {last.get('match_evidence', '')}"
+    if node_name == "join_resolution":
+        results = update.get("join_results") or []
+        if not results:
+            return "Step 3/6 실행 — 요청 컬럼이 단일 테이블뿐이라 조인 검증 스킵"
+        joinable = sum(1 for r in results if r.get("status") == "resolved")
+        added = [m for m in (update.get("meta_results") or []) if m.get("resolution_path") == "join_key_added"]
+        added_note = f" · 요청 목록에 없던 조인키 {len(added)}건을 담당자 승인 후 추가" if added else ""
+        return (
+            f"Step 3/6 실행 — 기존 관계(경유 포함) 우선 확인 → 없으면 이름/임베딩 후보를 "
+            f"실측 값 overlap으로 검증 후 담당자 확인 → 테이블 쌍 {len(results)}건 중 {joinable}건 조인 가능"
+            f"{added_note}"
+        )
     if node_name == "db_validation":
-        return f"Step 3/5 실행 — Guardrail(SELECT-only AST 검증 + READ_ONLY ATTACH) 하 실 DB 대조 → {len(update.get('validation_results', []))}건 검증 완료"
+        return f"Step 4/6 실행 — Guardrail(SELECT-only AST 검증 + READ_ONLY ATTACH) 하 실 DB 대조 → {len(update.get('validation_results', []))}건 검증 완료"
     if node_name == "classification":
-        return f"Step 4/5 실행 — 존재→type→기간 순서의 결정론적 규칙으로 최종 태깅 → {len(update.get('classified_results', []))}건 완료"
+        return f"Step 5/6 실행 — 존재→type→기간 순서의 결정론적 규칙으로 최종 태깅 → {len(update.get('classified_results', []))}건 완료"
     if node_name == "report":
-        return f"Step 5/5 실행 — 전체 경로별 결과 취합 후 명세서 생성 완료: {update.get('report_excel_path')}"
+        return f"Step 6/6 실행 — 전체 경로별 결과 취합 후 명세서 생성 완료: {update.get('report_excel_path')}"
     return "처리 완료"
 
 

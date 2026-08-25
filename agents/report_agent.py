@@ -29,6 +29,7 @@ RESOLUTION_PATH_LABEL = {
     "auto_confirmed": "AI 자동 확정",
     "rejected_by_human": "담당자 거절",
     "no_match": "매칭 후보 없음",
+    "join_key_added": "조인을 위해 자동 추가",
 }
 
 TAG_LABEL = {
@@ -47,10 +48,16 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
 
     # 경로 A/D: 정상 검증 (Classification까지 완료) — auto_confirmed 여부는 resolution_path로 구분
     for r in classified_results:
-        resolution_path = r.get("resolution_path") if r.get("resolution_path") in ("auto_confirmed",) else "validated"
+        resolution_path = (
+            r.get("resolution_path")
+            if r.get("resolution_path") in ("auto_confirmed", "join_key_added")
+            else "validated"
+        )
         evidence = r.get("evidence")
         if resolution_path == "auto_confirmed" and r.get("llm_evidence"):
             evidence = f"[AI 자동 확정] {r.get('llm_evidence')} | {evidence}"
+        elif resolution_path == "join_key_added" and r.get("match_evidence"):
+            evidence = f"[조인키 자동 추가] {r.get('match_evidence')} | {evidence}"
 
         rows.append({
             "영문명": r.get("영문명"),
@@ -87,6 +94,48 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
+# ── Tool: build_join_report (Join Resolution Agent 결과 취합) ─
+JOIN_SOURCE_LABEL = {
+    "declared": "기존 등록된 관계",
+    "inferred_confirmed": "AI 추정 + 담당자 확인",
+    "inferred_rejected": "AI 추정 - 담당자 거절",
+}
+
+
+def build_join_report(join_results: list) -> pd.DataFrame:
+    """명세서가 여러 테이블을 동시에 요청할 때, 그 테이블들을 실제로 하나의
+    결과셋으로 조인할 수 있는지를 별도 시트로 보여준다. 컬럼별 '제공가능' 판정과
+    달리, 여기서는 두 컬럼을 각각 받을 수 있어도 합쳐서 못 뽑는 경우를 잡아낸다."""
+    rows = []
+    for r in join_results or []:
+        if r["status"] == "resolved":
+            period = r.get("joined_period")
+            rows.append({
+                "테이블A": r["table_a"],
+                "테이블B": r["table_b"],
+                "조인키": r.get("join_key"),
+                "판정": "조인 가능",
+                "근거출처": JOIN_SOURCE_LABEL.get(r["source"], r["source"]),
+                "신뢰도": r.get("confidence"),
+                "타입일치": "일치" if r.get("type_consistent") else "불일치",
+                "조인가능기간(교집합)": _fmt_period(period) if period else "산출 불가(보유기간 정보 없음)",
+                "근거": r.get("evidence"),
+            })
+        else:
+            rows.append({
+                "테이블A": r["table_a"],
+                "테이블B": r["table_b"],
+                "조인키": None,
+                "판정": "조인 불가",
+                "근거출처": JOIN_SOURCE_LABEL.get(r.get("source"), r.get("source") or "-"),
+                "신뢰도": None,
+                "타입일치": None,
+                "조인가능기간(교집합)": None,
+                "근거": r.get("evidence"),
+            })
+    return pd.DataFrame(rows)
+
+
 def _fmt_period(period):
     if not period:
         return None
@@ -115,7 +164,8 @@ def _compute_tag_label(row) -> str:
 
 
 # ── Tool: generate_excel_report ────────────────────────────
-def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_명세서.xlsx"):
+def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_명세서.xlsx",
+                           join_df: pd.DataFrame = None):
     with tool_span("generate_excel_report (xlsxwriter)"):
         df = merged_df.copy()
         df["태그설명"] = df.apply(_compute_tag_label, axis=1)
@@ -138,6 +188,15 @@ def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_
             for col_idx, col_name in enumerate(df.columns):
                 worksheet.write(0, col_idx, col_name, header_fmt)
                 worksheet.set_column(col_idx, col_idx, max(14, len(col_name) + 4))
+
+            # 명세서가 2개 이상 테이블을 요청한 경우에만 존재 - 컬럼별 판정과 별개로
+            # "이 테이블들을 실제로 합쳐서 뽑을 수 있는가"를 보여주는 시트
+            if join_df is not None and not join_df.empty:
+                join_df.to_excel(writer, index=False, sheet_name="조인 가능성 검증")
+                join_sheet = writer.sheets["조인 가능성 검증"]
+                for col_idx, col_name in enumerate(join_df.columns):
+                    join_sheet.write(0, col_idx, col_name, header_fmt)
+                    join_sheet.set_column(col_idx, col_idx, max(14, len(str(col_name)) + 4))
 
     return output_path
 
@@ -167,14 +226,22 @@ def log_revision_snapshot(column_id: str, before_tag: str, after_tag: str, reaso
 
 # ── 오케스트레이션 ───────────────────────────────────────────
 @instrument_agent("Report Agent")
-def run_report(meta_results: list, classified_results: list, input_file_path: str = None, output_path: str = None) -> dict:
+def run_report(meta_results: list, classified_results: list, join_results: list = None,
+                input_file_path: str = None, output_path: str = None) -> dict:
     if output_path is None:
         output_path = _build_output_filename(input_file_path)
 
     with tool_span("aggregate_results"):
         merged_df = aggregate_results(meta_results, classified_results)
-    excel_path = generate_excel_report(merged_df, output_path)
+        join_df = build_join_report(join_results)
+    excel_path = generate_excel_report(merged_df, output_path, join_df=join_df)
     stats = compute_summary_stats(merged_df)
+    if join_results:
+        stats["join_summary"] = {
+            "pairs_checked": len(join_results),
+            "joinable": sum(1 for r in join_results if r["status"] == "resolved"),
+            "not_joinable": sum(1 for r in join_results if r["status"] != "resolved"),
+        }
 
     # 처리 완료 스냅샷 기록
     with tool_span(f"log_revision_snapshot ({len(merged_df)}건)"):
@@ -211,14 +278,18 @@ if __name__ == "__main__":
     from agents.meta_search_agent import run_meta_search
     from agents.db_validation_agent import run_db_validation
     from agents.classification_agent import run_classification
+    from agents.join_resolution_agent import run_join_resolution
     from llm_client import embed
 
     parsed = run_parsing(file_path)
     meta_results = run_meta_search(parsed["parsed_rows"], embed)
+    join_result = run_join_resolution(meta_results)
+    join_results = join_result["join_results"]
+    meta_results = join_result["meta_results"]  # 조인키가 자동 추가됐을 수 있으므로 갱신본 사용
     validation_results = run_db_validation(meta_results)
     classified = run_classification(validation_results)
 
-    result = run_report(meta_results, classified, input_file_path=file_path)
+    result = run_report(meta_results, classified, join_results=join_results, input_file_path=file_path)
 
     print("\n" + "=" * 60)
     print("[Report Agent 결과]")

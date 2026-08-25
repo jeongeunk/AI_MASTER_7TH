@@ -46,18 +46,29 @@ MAX_RETRIEVAL_ATTEMPTS = 2          # 재검색 최대 횟수
 
 # ── Tool: exact_match_meta_db ──────────────────────────────
 def exact_match_meta_db(con, eng_name: str) -> dict:
+    """
+    영문명이 여러 테이블에 동일하게 존재할 수 있다(예: mobile_number는 이 데이터셋의
+    6개 테이블 전부에 있음). 예전에는 fetchone()으로 그중 하나를 임의로(DB 내부
+    순서에 의존해) 골랐는데, 테이블마다 보유기간이 다를 수 있어(예: fact_data_usage는
+    202506까지, 나머지는 202512까지) 어느 테이블이 뽑히느냐에 따라
+    "제공가능시점(기간)" 자체가 달라진다 - 그래서 후보가 2개 이상이면 단일 확정하지
+    않고 ambiguous로 반환해 담당자 확인으로 넘긴다.
+    """
     with tool_span("exact_match_meta_db"):
-        row = con.execute(
+        rows = con.execute(
             "SELECT column_id, table_id, column_name, data_type, description "
             "FROM column_spec WHERE column_name = ?",
             [eng_name],
-        ).fetchone()
-    if row:
-        return {"found": True, "meta_row": {
-            "column_id": row[0], "table_id": row[1],
-            "column_name": row[2], "data_type": row[3], "description": row[4],
-        }}
-    return {"found": False, "meta_row": None}
+        ).fetchall()
+    candidates = [
+        {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
+        for r in rows
+    ]
+    if len(candidates) == 1:
+        return {"found": True, "ambiguous": False, "meta_row": candidates[0], "candidates": candidates}
+    if len(candidates) > 1:
+        return {"found": False, "ambiguous": True, "meta_row": None, "candidates": candidates}
+    return {"found": False, "ambiguous": False, "meta_row": None, "candidates": []}
 
 
 # ── Tool: fuzzy_match_candidates ───────────────────────────
@@ -332,6 +343,49 @@ def apply_confirmation_result(decision: str) -> dict:
     return {"final_tag": "unresolved", "confirmation_status": "rejected"}
 
 
+# ── Tool: request_table_disambiguation (담당자 확인) ───────
+def _console_table_disambiguation_confirm(payload: dict) -> dict:
+    print("\n" + "=" * 60)
+    print("[담당자 확인 요청 - 동일 컬럼명이 여러 테이블에 존재]")
+    print(f"  영문명: {payload['eng_name']}")
+    for i, c in enumerate(payload["candidates"]):
+        print(f"    [{i}] {c['table_id']} ({c['data_type']}) - {c['description']}")
+    print("=" * 60)
+    ans = input("사용할 테이블의 인덱스를 입력하세요 (없으면 그냥 엔터): ").strip()
+    if not ans:
+        return {"decision": "rejected"}
+    idx = int(ans)
+    return {"decision": "approved", "selected_table_id": payload["candidates"][idx]["table_id"]}
+
+
+def request_table_disambiguation(column_meta: dict, candidates: list, confirm_fn=None) -> dict:
+    """
+    영문명이 여러 테이블에 동일하게 존재해 단일 확정이 불가능할 때, 어느 테이블
+    소속 컬럼을 쓸지 담당자에게 직접 고르게 한다. 자동으로 하나를 골라버리지 않는
+    이유는 테이블마다 보유기간이 달라(예: 이 데이터셋에서 mobile_number는 6개
+    테이블에 다 있지만 fact_data_usage만 202506까지, 나머지는 202512까지) 어느
+    테이블이 선택되느냐에 따라 "제공가능시점(기간)" 자체가 달라지기 때문이다.
+    반환: {"decision": "approved"|"rejected", "selected_table_id": str 또는 None}
+    """
+    payload = {
+        "type": "table_disambiguation_confirmation",
+        "eng_name": column_meta.get("영문명"),
+        "kor_name": column_meta.get("한글명"),
+        "description": column_meta.get("항목설명"),
+        "candidates": [
+            {"table_id": c["table_id"], "column_name": c["column_name"],
+             "data_type": c["data_type"], "description": c["description"]}
+            for c in candidates
+        ],
+    }
+    fn = confirm_fn or _console_table_disambiguation_confirm
+    raw = fn(payload)
+    if isinstance(raw, dict):
+        return {"decision": raw.get("decision"), "selected_table_id": raw.get("selected_table_id")}
+    # confirm_fn이 단순 문자열만 반환하는 경우 - 어느 테이블인지 근거가 없으므로 거절 처리
+    return {"decision": "rejected", "selected_table_id": None}
+
+
 # ── Tool: update_meta_tag (Classification Agent와 공유) ────
 def update_meta_tag(con, column_id: str, tag: str, confidence: float = None):
     with tool_span("update_meta_tag"):
@@ -424,6 +478,25 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
             out = {**row, "match_status": "matched", "meta_row": exact["meta_row"],
                    "match_evidence": "영문명 정확 매칭", "resolution_path": "validated"}
             results.append(_enrich_relationships(con, out))
+            continue
+
+        if exact.get("ambiguous"):
+            candidates_by_table = exact["candidates"]
+            decision = request_table_disambiguation(row, candidates_by_table, confirm_fn=confirm_fn)
+            table_ids = [c["table_id"] for c in candidates_by_table]
+            if decision.get("decision") == "approved" and decision.get("selected_table_id"):
+                selected = next(c for c in candidates_by_table if c["table_id"] == decision["selected_table_id"])
+                out = {**row, "match_status": "matched", "meta_row": selected,
+                       "match_evidence": f"영문명 정확 매칭 - 동일 컬럼명이 {len(table_ids)}개 테이블"
+                                          f"({', '.join(table_ids)})에 존재해 담당자가 {selected['table_id']} 선택",
+                       "resolution_path": "validated"}
+                results.append(_enrich_relationships(con, out))
+            else:
+                out = {**row, "match_status": "unresolved", "meta_row": None,
+                       "match_evidence": f"동일 컬럼명이 {len(table_ids)}개 테이블({', '.join(table_ids)})에 존재하나 "
+                                          f"담당자가 테이블을 선택하지 않음",
+                       "unresolved_reason": "ambiguous_table_rejected", "resolution_path": "rejected_by_human"}
+                results.append(out)
             continue
 
         attempts = 0

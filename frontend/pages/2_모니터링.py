@@ -6,7 +6,8 @@ Agent 실행 모니터링: 각 Agent(노드)의 시작/종료 시각·소요시�
 - SchemaScout 메인 화면의 '업로드 및 파싱' 단계(Parsing Agent, 동기 호출)와
   파이프라인 시작 이후의 5-Agent 그래프 실행을 모두 여기서 확인한다.
 - 담당자 확인(HITL): inferred_confirmation, type_mismatch_confirmation,
-  header_mapping_confirmation, row_completion_confirmation 승인/거절
+  header_mapping_confirmation, row_completion_confirmation, join_key_confirmation,
+  missing_join_key_confirmation, table_disambiguation_confirmation 승인/거절
 - 실시간 갱신: st.fragment(run_every=2)로 상태/로그 영역만 2초마다 자체 재실행한다.
   (페이지 전체를 새로고침하지 않아 스크롤 위치·다른 화면 요소가 끊기지 않음)
 """
@@ -89,10 +90,12 @@ st.caption(f"thread_id: `{thread_id}` · 상태/로그는 2초마다 자동 갱�
 STAGE_ORDER = [
     ("1", "Parsing"),
     ("2", "Meta Search"),
-    ("3", "DB Validation"),
-    ("4", "Classification"),
-    ("5", "Report"),
+    ("3", "Join Resolution"),
+    ("4", "DB Validation"),
+    ("5", "Classification"),
+    ("6", "Report"),
 ]
+N_STAGES = len(STAGE_ORDER)
 
 
 def _render_stage_summary(events: list, status: str):
@@ -101,7 +104,7 @@ def _render_stage_summary(events: list, status: str):
     seen_steps = [int(ev["plan_step"].split("/")[0]) for ev in events if ev.get("plan_step")]
     max_step = max(seen_steps) if seen_steps else 0
 
-    cols = st.columns(5)
+    cols = st.columns(N_STAGES)
     for i, (step_key, label) in enumerate(STAGE_ORDER, start=1):
         if status == "done" or i < max_step:
             badge, bg, fg = "완료", "#E8F3E8", "#2E7D32"
@@ -123,12 +126,12 @@ def _render_stage_summary(events: list, status: str):
                 unsafe_allow_html=True,
             )
 
-    progress = min(max_step, 5) / 5 if status != "done" else 1.0
+    progress = min(max_step, N_STAGES) / N_STAGES if status != "done" else 1.0
     st.progress(progress)
 
     total_tool_calls = sum(len(ev.get("tool_calls") or []) for ev in events)
     m1, m2, m3 = st.columns(3)
-    m1.metric("완료된 단계", f"{min(max_step, 5)}/5")
+    m1.metric("완료된 단계", f"{min(max_step, N_STAGES)}/{N_STAGES}")
     m2.metric("총 이벤트", len(events))
     m3.metric("총 tool 호출", total_tool_calls)
 
@@ -191,6 +194,7 @@ def _live_pipeline_panel(thread_id: str):
         with st.container(border=True):
             selected_header = None  # header_mapping_confirmation에서만 사용
             selected_row_idx = None  # header_row_confirmation에서만 사용
+            selected_table_id = None  # table_disambiguation_confirmation에서만 사용
             custom_ui_handled = False  # row_completion_confirmation처럼 자체 버튼을 그리는 경우 True
 
             if payload["type"] == "header_row_confirmation":
@@ -229,11 +233,54 @@ def _live_pipeline_panel(thread_id: str):
                     st.markdown(f"**후보 설명**: {payload['candidate_description']}")
                 approve_label, reject_label = "✅ 승인", "❌ 거절"
 
+            elif payload["type"] == "table_disambiguation_confirmation":
+                st.markdown(f"**`{payload['eng_name']}` 컬럼명이 여러 테이블에 동일하게 존재합니다**")
+                st.caption("테이블마다 보유기간이 다를 수 있어(예: 어떤 테이블은 최근 달까지, "
+                           "어떤 테이블은 그보다 짧게) 어느 테이블 소속으로 처리할지에 따라 "
+                           "제공가능시점(기간) 자체가 달라집니다. 직접 골라주세요.")
+                cand_df = pd.DataFrame([
+                    {"테이블": c["table_id"], "type": c["data_type"], "설명": c["description"]}
+                    for c in payload["candidates"]
+                ])
+                st.dataframe(cand_df, use_container_width=True, hide_index=True)
+
+                table_options = [c["table_id"] for c in payload["candidates"]]
+                selected_table_id = st.radio(
+                    "사용할 테이블 선택", table_options, horizontal=False,
+                    key=f"table_disambig_{thread_id}_{payload['eng_name']}",
+                )
+                approve_label, reject_label = "이 테이블로 확정", "선택 안 함(매칭 실패 처리)"
+
             elif payload["type"] == "type_mismatch_confirmation":
                 st.markdown(f"**컬럼**: {payload['column_id']} (테이블: {payload['table']})")
                 st.markdown(f"**명세 type**: {payload['spec_type']}")
                 st.markdown(f"**실제 type**: {payload['actual_type']}")
                 approve_label, reject_label = "✅ 실제 DB 기준으로 갱신", "❌ 명세 기준 유지"
+
+            elif payload["type"] == "join_key_confirmation":
+                st.markdown(f"**{payload['table_a']}** ↔ **{payload['table_b']}** 를 조인할 키를 찾지 못해 추정했습니다")
+                st.caption("등록된 관계가 없어 이름/임베딩 유사도로 후보를 찾고, 실제 데이터 값이 "
+                           "얼마나 겹치는지(포함률)까지 확인한 결과입니다. 승인하면 다음부터는 "
+                           "재확인 없이 재사용됩니다.")
+                st.markdown(f"**추정 조인키**: `{payload['join_key']}`")
+                stats = payload["overlap_stats"]
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("A→B 포함률", f"{stats['containment_a_in_b'] * 100:.1f}%")
+                sc2.metric("B→A 포함률", f"{stats['containment_b_in_a'] * 100:.1f}%")
+                sc3.metric("겹치는 값", f"{stats['overlap_count']}건")
+                st.caption(payload["evidence"])
+                approve_label, reject_label = "✅ 이 키로 조인 확정", "❌ 조인 불가로 처리"
+
+            elif payload["type"] == "missing_join_key_confirmation":
+                st.markdown(f"**요청 목록에 `{payload['key_column']}` 컬럼이 없어 조인 결과를 실제로 묶을 수 없습니다**")
+                st.caption("컬럼별로는 각각 제공 가능해도, 서로 다른 테이블에서 온 컬럼을 한 행으로 합치려면 "
+                           "조인키 자체가 인도물에 포함돼 있어야 합니다.")
+                st.markdown(f"**관련 테이블**: {', '.join(payload['tables'])}")
+                st.markdown("**이 키가 없으면 못 묶는 테이블 쌍**")
+                for a, b in payload["needed_for"]:
+                    st.markdown(f"- {a} ↔ {b}")
+                st.caption(payload["evidence"])
+                approve_label, reject_label = f"✅ {payload['key_column']} 추가", "❌ 추가 안 함"
 
             elif payload["type"] == "header_mapping_confirmation":
                 st.markdown(f"**표준 필드 \"{payload['missing_std_field']}\"에 해당하는 컬럼을 찾지 못했습니다**")
@@ -316,11 +363,14 @@ def _live_pipeline_panel(thread_id: str):
                         api_client.confirm(thread_id, {"decision": "approved", "selected_column": selected_header})
                     elif payload["type"] == "header_row_confirmation":
                         api_client.confirm(thread_id, {"decision": "approved", "selected_row_idx": selected_row_idx})
+                    elif payload["type"] == "table_disambiguation_confirmation":
+                        api_client.confirm(thread_id, {"decision": "approved", "selected_table_id": selected_table_id})
                     else:
                         api_client.confirm(thread_id, "approved")
                     st.rerun()
                 if c2.button(reject_label, use_container_width=True):
-                    if payload["type"] in ("header_mapping_confirmation", "header_row_confirmation"):
+                    if payload["type"] in ("header_mapping_confirmation", "header_row_confirmation",
+                                            "table_disambiguation_confirmation"):
                         api_client.confirm(thread_id, {"decision": "rejected"})
                     else:
                         api_client.confirm(thread_id, "rejected")

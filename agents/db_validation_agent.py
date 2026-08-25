@@ -14,6 +14,7 @@ Guardrail:
 """
 
 import os
+import re
 import sys
 import sqlite3
 import duckdb
@@ -32,6 +33,20 @@ AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
 MAX_ROWS = 100_000
 QUERY_TIMEOUT_SEC = 30
+
+# ── 보안: table/column 식별자는 파라미터 바인딩이 불가능해(DuckDB가 식별자 위치
+#    파라미터를 지원하지 않음) f-string으로 쿼리에 넣어야 하는데, 그 값들이
+#    (메타DB에 실제 존재한다고 보장되지 않는) 파싱 결과 영문명 -> 메타 매칭 체인을
+#    거쳐 흘러온 값이라 신뢰 경계가 모호하다. 영숫자/언더스코어만 허용하는
+#    화이트리스트 검증으로 SQL 인젝션(세미콜론 주입, 주석 처리 등)을 원천 차단한다.
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _safe_ident(name: str) -> str:
+    """테이블/컬럼명을 f-string SQL에 삽입하기 전 검증 + 이중따옴표 quoting."""
+    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+        raise ValueError(f"허용되지 않는 테이블/컬럼 식별자입니다: {name!r}")
+    return f'"{name}"'
 
 
 # ── Step 0: Guardrail ───────────────────────────────────────
@@ -184,12 +199,14 @@ def detect_month_like_columns(con, table: str) -> list:
     ).fetchall()
 
     month_like = []
+    safe_table = _safe_ident(table)
     for (column_name,) in candidates:
+        safe_col = _safe_ident(column_name)
         total, valid = con.execute(
             f"SELECT COUNT(*), COUNT(*) FILTER ("
-            f"CAST({column_name} AS BIGINT) BETWEEN 190001 AND 299912 "
-            f"AND CAST({column_name} AS BIGINT) % 100 BETWEEN 1 AND 12"
-            f") FROM data_db.{table} WHERE {column_name} IS NOT NULL"
+            f"CAST({safe_col} AS BIGINT) BETWEEN 190001 AND 299912 "
+            f"AND CAST({safe_col} AS BIGINT) % 100 BETWEEN 1 AND 12"
+            f") FROM data_db.{safe_table} WHERE {safe_col} IS NOT NULL"
         ).fetchone()
         if total and total == valid:
             month_like.append(column_name)
@@ -205,7 +222,8 @@ def query_retention_period(con, table: str, column: str) -> dict:
             [table],
         ).fetchone()[0]
         if has_month:
-            row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{table}").fetchone()
+            safe_table = _safe_ident(table)
+            row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{safe_table}").fetchone()
             return {"start": row[0], "end": row[1], "estimated": False, "estimated_from": None}
 
         # month 컬럼이 없는 dim 테이블 등: month로 추정되는 컬럼으로 보유기간 추정
@@ -213,8 +231,9 @@ def query_retention_period(con, table: str, column: str) -> dict:
         if not month_like_cols:
             return {"start": None, "end": None, "estimated": False, "estimated_from": None}
 
+        safe_table = _safe_ident(table)
         union_sql = " UNION ALL ".join(
-            f"SELECT {c} AS m FROM data_db.{table} WHERE {c} IS NOT NULL"
+            f"SELECT {_safe_ident(c)} AS m FROM data_db.{safe_table} WHERE {_safe_ident(c)} IS NOT NULL"
             for c in month_like_cols
         )
         row = con.execute(f"SELECT MIN(m), MAX(m) FROM ({union_sql})").fetchone()

@@ -27,9 +27,12 @@ import json
 import os
 import re
 import sys
+from typing import List, Optional
+
 import duckdb
 import pandas as pd
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents.meta_search_agent import exact_match_meta_db, retrieve_candidates, SIMILARITY_PREFILTER_FLOOR
@@ -85,6 +88,14 @@ def _find_header_row_candidates(raw: pd.DataFrame, min_hits: int = 3) -> list:
     return candidates
 
 
+class HeaderRowJudgment(BaseModel):
+    """select_header_row_with_llm의 Structured Output 스키마."""
+    header_row_idx: Optional[int] = Field(
+        default=None, description="후보 목록 중 하나의 row_idx. 적합한 행이 없으면 null."
+    )
+    evidence: str = Field(description="40자 내외, 왜 이 행을 선택했는지(또는 왜 못 골랐는지)")
+
+
 def select_header_row_with_llm(candidates: list) -> tuple:
     """
     후보 헤더 행이 0개 또는 2개 이상으로 애매할 때, 후보 행들의 내용을 LLM(gpt-4.1-mini)에게
@@ -95,7 +106,7 @@ def select_header_row_with_llm(candidates: list) -> tuple:
     if not candidates:
         return None, "후보 행이 전혀 없음"
 
-    from llm_client import chat
+    from llm_client import chat_parsed
 
     candidate_lines = "\n".join(
         f"- row_idx={c['row_idx']}: {c['preview']}" for c in candidates
@@ -104,31 +115,30 @@ def select_header_row_with_llm(candidates: list) -> tuple:
         "너는 데이터 명세서 파일에서 실제 컬럼 헤더가 있는 행을 찾는 보조자다.\n"
         "아래 \"후보 행 목록\"만 근거로 판단한다. 목록에 없는 row_idx를 임의로 만들어내지 않는다.\n"
         "후보 행 목록은 표준 필드(영문명/한글명/항목설명/type/시점) 키워드가 일부 포함된 행들이며,\n"
-        "이 중 설명/요약 문구가 아니라 실제 표의 컬럼 헤더 역할을 하는 행 하나를 고른다.\n"
-        "반드시 다음 JSON 스키마로만 응답한다:\n"
-        '{"header_row_idx": 후보 목록 중 하나의 row_idx(정수) 또는 null(적합한 행 없음), '
-        '"evidence": "40자 내외, 왜 이 행을 선택했는지(또는 왜 못 골랐는지)"}'
+        "이 중 설명/요약 문구가 아니라 실제 표의 컬럼 헤더 역할을 하는 행 하나를 고른다."
     )
     user_prompt = f"후보 행 목록:\n{candidate_lines}"
 
     with tool_span("select_header_row_with_llm", model="gpt-4.1-mini"):
-        response = chat(
+        response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
-            response_format={"type": "json_object"},
+            response_format=HeaderRowJudgment,
         )
-    parsed = json.loads(response.choices[0].message.content)
-    selected = parsed.get("header_row_idx")
-    evidence = parsed.get("evidence", "")
+    message = response.choices[0].message
+    judgment = getattr(message, "parsed", None)
+    if judgment is None:
+        reason = getattr(message, "refusal", None) or "Structured Output 응답 없음"
+        return None, reason
 
     valid_indices = {c["row_idx"] for c in candidates}
-    if selected in valid_indices:
-        return selected, evidence
-    return None, evidence
+    if judgment.header_row_idx in valid_indices:
+        return judgment.header_row_idx, judgment.evidence
+    return None, judgment.evidence
 
 
 # ── 담당자 확인 (헤더 "행" 판별 실패 시) ─────────────────────
@@ -223,6 +233,20 @@ def map_columns_by_header(df: pd.DataFrame, header_row: int = 0) -> dict:
 
 
 # ── Tool 2.5 (신규): generate_header_mapping_judgment ──────
+class HeaderFieldMapping(BaseModel):
+    std_field: str = Field(description="표준 필드명 (영문명/한글명/항목설명 중 하나)")
+    matched_column: Optional[str] = Field(
+        default=None, description="원본 헤더 목록 중 하나. 적합한 헤더가 없으면 null."
+    )
+    confidence: float = Field(description="0.0~1.0 사이의 확신도")
+    evidence: str = Field(description="40자 내외, 왜 이 헤더를 선택했는지(또는 왜 못 찾았는지, 샘플값 근거 포함)")
+
+
+class HeaderMappingJudgment(BaseModel):
+    """generate_header_mapping_judgment의 Structured Output 스키마."""
+    mappings: List[HeaderFieldMapping]
+
+
 def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame, unmapped_columns: list) -> list:
     """
     규칙 매칭 실패한 표준 필드에 한해, 아직 배정되지 않은 원본 헤더 후보 중
@@ -237,7 +261,7 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
     if not missing_std_fields or not unmapped_columns:
         return []
 
-    from llm_client import chat  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
+    from llm_client import chat_parsed  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
 
     header_samples = []
     for col in unmapped_columns:
@@ -253,10 +277,7 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
         "적극 활용해 판단한다. 예를 들어 헤더명이 '필드코드'라도 샘플값이 'cust_id', 'cust_name'처럼 "
         "영문 식별자라면 영문명일 가능성이 높다.\n"
         "원본 헤더 목록에 없는 컬럼명을 임의로 만들어내지 않는다.\n"
-        "하나의 원본 헤더는 하나의 표준 필드에만 매핑한다.\n"
-        "반드시 다음 JSON 스키마로만 응답한다:\n"
-        '{"mappings": [{"std_field": "표준 필드명", "matched_column": "원본 헤더 목록 중 하나 또는 null(적합한 헤더 없음)", '
-        '"confidence": 0.0, "evidence": "40자 내외, 왜 이 헤더를 선택했는지(또는 왜 못 찾았는지, 샘플값 근거 포함)"}]}'
+        "하나의 원본 헤더는 하나의 표준 필드에만 매핑한다."
     )
     user_prompt = (
         f"매핑이 필요한 표준 필드 목록: {missing_std_fields}\n"
@@ -264,17 +285,20 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
     )
 
     with tool_span("generate_header_mapping_judgment", model="gpt-4.1-mini"):
-        response = chat(
+        response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
-            response_format={"type": "json_object"},
+            response_format=HeaderMappingJudgment,
         )
-    parsed = json.loads(response.choices[0].message.content)
-    return parsed.get("mappings", [])
+    message = response.choices[0].message
+    judgment = getattr(message, "parsed", None)
+    if judgment is None:
+        return []
+    return [m.model_dump() for m in judgment.mappings]
 
 
 # ── JSON 안전 변환 (pandas 결측치 NaN -> None) ─────────────
@@ -339,42 +363,53 @@ def _meta_description_parts(description) -> tuple:
     return None, text
 
 
+class NameFieldInference(BaseModel):
+    field: str = Field(description="요청 필드명 (영문명/한글명/항목설명 중 하나)")
+    value: Optional[str] = Field(default=None, description="추론값. 전혀 짐작할 수 없으면 null.")
+    confidence: float = Field(description="0.0~1.0 사이의 확신도. 확실하지 않으면 0.3 이하로.")
+    evidence: str = Field(description="40자 내외 근거")
+
+
+class NameFieldInferenceResult(BaseModel):
+    """infer_name_fields_with_llm의 Structured Output 스키마."""
+    fields: List[NameFieldInference]
+
+
 def infer_name_fields_with_llm(present_fields: dict, missing_fields: list) -> dict:
     """메타DB에 후보가 없을 때, LLM 자체 지식으로 누락된 영문명/한글명/항목설명을 추론(참고용).
     반환: {필드명: {"value": 추론값 또는 None, "confidence": float, "evidence": str}}
     """
-    from llm_client import chat  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
+    from llm_client import chat_parsed  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
 
     system_prompt = (
         "너는 통신사 데이터 컬럼 명세의 영문명/한글명/항목설명 간 관계를 잘 아는 전문가다.\n"
         "아래 \"알려진 정보\"를 보고 \"요청 필드\" 각각에 대해 가장 그럴듯한 값을 추론한다.\n"
-        "확실하지 않으면 낮은 확신도(0.3 이하)로 응답하고, 전혀 짐작할 수 없으면 value를 null로 응답한다.\n"
-        "반드시 다음 JSON 스키마로만 응답한다:\n"
-        '{"fields": [{"field": "요청 필드명", "value": "추론값 또는 null", "confidence": 0.0, '
-        '"evidence": "40자 내외 근거"}]}'
+        "확실하지 않으면 낮은 확신도(0.3 이하)로 응답하고, 전혀 짐작할 수 없으면 value를 null로 응답한다."
     )
     user_prompt = f"알려진 정보: {present_fields}\n요청 필드: {missing_fields}"
 
     with tool_span("infer_name_fields_with_llm", model="gpt-4.1-mini"):
-        response = chat(
+        response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
-            response_format={"type": "json_object"},
+            response_format=NameFieldInferenceResult,
         )
-    parsed = json.loads(response.choices[0].message.content)
+    message = response.choices[0].message
+    judgment = getattr(message, "parsed", None)
 
     result = {f: {"value": None, "confidence": 0.0, "evidence": ""} for f in missing_fields}
-    for entry in parsed.get("fields", []):
-        f = entry.get("field")
-        if f in result:
-            result[f] = {
-                "value": entry.get("value"),
-                "confidence": max(0.0, min(1.0, float(entry.get("confidence") or 0.0))),
-                "evidence": entry.get("evidence", ""),
+    if judgment is None:
+        return result
+    for entry in judgment.fields:
+        if entry.field in result:
+            result[entry.field] = {
+                "value": entry.value,
+                "confidence": max(0.0, min(1.0, entry.confidence)),
+                "evidence": entry.evidence,
             }
     return result
 

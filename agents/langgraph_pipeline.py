@@ -5,11 +5,13 @@ SchemaScout LangGraph 파이프라인 (conditional_edge 전환판)
 하나의 StateGraph로 연결한다. Meta Search 단계는 컬럼 단위로 아래 6개 노드를 돌며
 add_conditional_edges로 자동확정/재검색/담당자확인 3갈래를 그래프 레벨에서 분기한다.
 
-    meta_exact_check -> (found: 다음 컬럼 또는 db_validation로 / not found: meta_retrieve)
+    meta_exact_check -> (단일 매칭: 다음 컬럼 또는 join_resolution / 동일 컬럼명이 여러
+                          테이블에 존재(ambiguous): meta_table_disambiguation / 매칭 없음: meta_retrieve)
     meta_retrieve -> (후보 없음: meta_no_match / 있음: meta_judge)
     meta_judge -> (auto_confirm / retry / human_confirm)
     meta_retry -> meta_retrieve (재검색 루프, 최대 MAX_RETRIEVAL_ATTEMPTS회)
-    meta_auto_confirm / meta_human_confirm / meta_no_match -> (다음 컬럼 또는 db_validation)
+    meta_auto_confirm / meta_human_confirm / meta_no_match / meta_table_disambiguation
+        -> (다음 컬럼 또는 join_resolution)
 
 담당자 확인(interrupt/inferred)과 type 불일치 확인(interrupt/db_validation)은 기존과
 동일하게 노드 함수 내부에서 interrupt()를 호출하는 confirm_fn으로 처리한다.
@@ -38,6 +40,7 @@ from agents.meta_search_agent import (
     decide_route,
     expand_retrieval_params,
     request_inferred_confirmation,
+    request_table_disambiguation,
     apply_confirmation_result,
     update_meta_tag,
     log_auto_confirm,
@@ -45,6 +48,7 @@ from agents.meta_search_agent import (
     get_table_relationships,
     SIMILARITY_PREFILTER_FLOOR,
 )
+from agents.join_resolution_agent import run_join_resolution
 from agents.db_validation_agent import run_db_validation
 from agents.classification_agent import run_classification
 from agents.report_agent import run_report
@@ -66,13 +70,16 @@ class PipelineState(TypedDict, total=False):
     meta_columns: list
     meta_index: int
     meta_results: list
-    exact_found: object  # True / False / "empty"
+    exact_found: object  # True / False / "empty" / "ambiguous"
+    exact_candidates: list  # 동일 컬럼명이 여러 테이블에 있을 때(ambiguous)의 후보 목록
     current_candidates: list
     current_judgment: dict
     retrieval_attempts: int
     current_top_k: int
     current_floor: float
     current_glossary_boost: bool
+
+    join_results: list  # Join Resolution Agent: 여러 테이블을 요청한 명세서의 조인 가능성 검증 결과
 
     validation_results: list
     classified_results: list
@@ -139,6 +146,9 @@ def meta_exact_check_node(state: PipelineState) -> dict:
             "meta_index": idx + 1,
             "exact_found": True,
         }
+    if exact.get("ambiguous"):
+        con.close()
+        return {"exact_found": "ambiguous", "exact_candidates": exact["candidates"]}
     con.close()
     return {
         "exact_found": False,
@@ -155,7 +165,38 @@ def route_after_exact(state: PipelineState) -> str:
         return "done"
     if ef is True:
         return "done" if state["meta_index"] >= len(state["meta_columns"]) else "next_column"
+    if ef == "ambiguous":
+        return "disambiguate"
     return "search"
+
+
+@instrument_agent("Meta Search Agent (table disambiguation)")
+def meta_table_disambiguation_node(state: PipelineState) -> dict:
+    col = state["meta_columns"][state["meta_index"]]
+    candidates = state["exact_candidates"]
+
+    decision = request_table_disambiguation(col, candidates, confirm_fn=graph_confirm_fn)
+    table_ids = [c["table_id"] for c in candidates]
+
+    con = _get_meta_con()
+    if decision.get("decision") == "approved" and decision.get("selected_table_id"):
+        selected = next(c for c in candidates if c["table_id"] == decision["selected_table_id"])
+        out = {**col, "match_status": "matched", "meta_row": selected,
+               "match_evidence": f"영문명 정확 매칭 - 동일 컬럼명이 {len(table_ids)}개 테이블"
+                                  f"({', '.join(table_ids)})에 존재해 담당자가 {selected['table_id']} 선택",
+               "resolution_path": "validated"}
+        out = _enrich(con, out)
+    else:
+        out = {**col, "match_status": "unresolved", "meta_row": None,
+               "match_evidence": f"동일 컬럼명이 {len(table_ids)}개 테이블({', '.join(table_ids)})에 존재하나 "
+                                  f"담당자가 테이블을 선택하지 않음",
+               "unresolved_reason": "ambiguous_table_rejected", "resolution_path": "rejected_by_human"}
+    con.close()
+
+    return {
+        "meta_results": state["meta_results"] + [out],
+        "meta_index": state["meta_index"] + 1,
+    }
 
 
 @instrument_agent("Meta Search Agent (retrieve)")
@@ -274,6 +315,16 @@ def route_after_resolution(state: PipelineState) -> str:
     return "done" if state["meta_index"] >= len(state["meta_columns"]) else "next_column"
 
 
+# ── 노드 정의: Join Resolution (Meta Search 서브플로우 완료 직후) ─
+@instrument_agent("Join Resolution Agent")
+def join_resolution_node(state: PipelineState) -> dict:
+    result = run_join_resolution(state["meta_results"], confirm_fn=graph_confirm_fn)
+    # meta_results를 갱신본으로 교체 - 조인에 필요한데 요청 목록에 없던 키 컬럼이
+    # 담당자 승인으로 추가됐다면, 이후 DB Validation부터는 이 갱신본을 이어받아야
+    # 추가된 키도 다른 요청 컬럼과 똑같이 검증되고 리포트에 노출된다.
+    return {"join_results": result["join_results"], "meta_results": result["meta_results"]}
+
+
 # ── 노드 정의: 이후 단계 (기존과 동일) ─────────────────────────
 @instrument_agent("DB Validation Agent")
 def db_validation_node(state: PipelineState) -> dict:
@@ -289,7 +340,10 @@ def classification_node(state: PipelineState) -> dict:
 
 @instrument_agent("Report Agent")
 def report_node(state: PipelineState) -> dict:
-    result = run_report(state["meta_results"], state["classified_results"], input_file_path=state["input_file"])
+    result = run_report(
+        state["meta_results"], state["classified_results"],
+        join_results=state.get("join_results"), input_file_path=state["input_file"],
+    )
     return {"report_excel_path": result["excel_path"], "report_stats": result["stats"]}
 
 
@@ -306,6 +360,8 @@ def build_graph():
     graph.add_node("meta_auto_confirm", meta_auto_confirm_node)
     graph.add_node("meta_retry", meta_retry_node)
     graph.add_node("meta_human_confirm", meta_human_confirm_node)
+    graph.add_node("meta_table_disambiguation", meta_table_disambiguation_node)
+    graph.add_node("join_resolution", join_resolution_node)
     graph.add_node("db_validation", db_validation_node)
     graph.add_node("classification", classification_node)
     graph.add_node("report", report_node)
@@ -316,7 +372,8 @@ def build_graph():
 
     graph.add_conditional_edges(
         "meta_exact_check", route_after_exact,
-        {"search": "meta_retrieve", "next_column": "meta_exact_check", "done": "db_validation"},
+        {"search": "meta_retrieve", "next_column": "meta_exact_check", "done": "join_resolution",
+         "disambiguate": "meta_table_disambiguation"},
     )
     graph.add_conditional_edges(
         "meta_retrieve", route_after_retrieve,
@@ -328,12 +385,13 @@ def build_graph():
     )
     graph.add_edge("meta_retry", "meta_retrieve")
 
-    for node_name in ("meta_auto_confirm", "meta_human_confirm", "meta_no_match"):
+    for node_name in ("meta_auto_confirm", "meta_human_confirm", "meta_no_match", "meta_table_disambiguation"):
         graph.add_conditional_edges(
             node_name, route_after_resolution,
-            {"next_column": "meta_exact_check", "done": "db_validation"},
+            {"next_column": "meta_exact_check", "done": "join_resolution"},
         )
 
+    graph.add_edge("join_resolution", "db_validation")
     graph.add_edge("db_validation", "classification")
     graph.add_edge("classification", "report")
     graph.add_edge("report", END)

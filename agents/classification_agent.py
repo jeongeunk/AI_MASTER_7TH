@@ -51,6 +51,28 @@ def _parse_period(period_str: str):
     return int(parts[0]), int(parts[1])
 
 
+def intersect_periods(periods: list) -> tuple:
+    """
+    N개 (start, end) 기간의 교집합을 구한다. periods 중 하나라도 None을 포함하면
+    (기간 정보 없음) 교집합도 구할 수 없으므로 None 반환. 겹치는 구간이 없어도 None.
+    Join Resolution Agent가 조인에 관여하는 모든 테이블의 보유기간 교집합(=조인된
+    결과가 실제로 유효한 기간)을 구할 때 재사용한다 - compare_period의 2개짜리
+    overlap 계산을 N개로 일반화한 것.
+    """
+    starts, ends = [], []
+    for p in periods:
+        if not p or p[0] is None or p[1] is None:
+            return None
+        starts.append(p[0])
+        ends.append(p[1])
+    if not starts:
+        return None
+    overlap_start, overlap_end = max(starts), min(ends)
+    if overlap_start > overlap_end:
+        return None
+    return (overlap_start, overlap_end)
+
+
 def compare_period(requested: tuple, retained: tuple) -> dict:
     req_start, req_end = requested
     ret_start, ret_end = retained
@@ -64,10 +86,9 @@ def compare_period(requested: tuple, retained: tuple) -> dict:
         return {"tag": "full_period", "final_period": (ret_start, ret_end),
                 "evidence": f"요청기간 미기재 - 현재 보유 중인 전체 기간({ret_start}~{ret_end})을 참고로 제공"}
 
-    overlap_start = max(req_start, ret_start)
-    overlap_end = min(req_end, ret_end)
+    overlap = intersect_periods([(req_start, req_end), (ret_start, ret_end)])
 
-    if overlap_start > overlap_end:
+    if overlap is None:
         return {"tag": "period_mismatch", "final_period": None,
                 "evidence": f"요청기간({req_start}~{req_end})과 보유기간({ret_start}~{ret_end}) 겹치는 구간 없음"}
 
@@ -75,8 +96,8 @@ def compare_period(requested: tuple, retained: tuple) -> dict:
         return {"tag": "full_period", "final_period": (req_start, req_end),
                 "evidence": f"요청기간 전체가 보유기간({ret_start}~{ret_end})에 포함됨"}
 
-    return {"tag": "confirm_period", "final_period": (overlap_start, overlap_end),
-            "evidence": f"요청기간 일부만 보유 -> 제공가능 기간({overlap_start}~{overlap_end})으로 조정"}
+    return {"tag": "confirm_period", "final_period": overlap,
+            "evidence": f"요청기간 일부만 보유 -> 제공가능 기간({overlap[0]}~{overlap[1]})으로 조정"}
 
 
 # ── 오케스트레이션 ───────────────────────────────────────────

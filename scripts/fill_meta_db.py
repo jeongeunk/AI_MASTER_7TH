@@ -103,6 +103,17 @@ TYPE_MISMATCH_INJECT = {
     "raw_telecom_dim_customer": {"churn_month": "VARCHAR"},              # 실제 DOUBLE -> 명세엔 VARCHAR
 }
 
+# ── not_found 테스트용 유령 컬럼 ─────────────────────────────
+# 메타DB(column_spec)엔 존재하지만 실 데이터 DB엔 없는 컬럼을 의도적으로 심어둔다.
+# Meta Search는 exact match로 찾아내지만(matched), DB Validation의 check_column_exists가
+# 실패해 not_found로 확정되는 경로를 재현하기 위함(TYPE_MISMATCH_INJECT와 같은 취지).
+# (table_id, column_name, data_type, 한글명, 설명)
+PHANTOM_COLUMN_INJECT = [
+    ("raw_telecom_fact_data_usage", "legacy_churn_flag", "INTEGER",
+     "레거시이탈플래그",
+     "과거 시스템에서 쓰이던 이탈 플래그 컬럼입니다. 현재 실 데이터에는 존재하지 않습니다(not_found 테스트용)."),
+]
+
 
 def main():
     data_con = duckdb.connect(DATA_DB_PATH, read_only=True)
@@ -138,6 +149,10 @@ def main():
                 column_id, table_id, col_name, spec_type, kor_name, desc,
                 None, None,  # tag, confidence: 파이프라인 실행 전이라 NULL
             ))
+
+    for table_id, col_name, spec_type, kor_name, desc in PHANTOM_COLUMN_INJECT:
+        column_id = f"{table_id}.{col_name}"
+        rows_column_spec.append((column_id, table_id, col_name, spec_type, kor_name, desc, None, None))
 
     # ── 메타 DB 적재 ─────────────────────────────────────
     meta_con.execute("DELETE FROM table_catalog")
@@ -179,6 +194,9 @@ def main():
     print("\n[의도적으로 넣은 type_mismatch 테스트 케이스]")
     for tname, col, actual, spec in mismatch_log:
         print(f"  {tname}.{col} : 실제={actual} / 명세={spec}")
+    print("\n[의도적으로 넣은 not_found 테스트용 유령 컬럼]")
+    for table_id, col_name, *_ in PHANTOM_COLUMN_INJECT:
+        print(f"  {table_id}.{col_name} : 메타DB엔 있지만 실 DB엔 없음")
 
     data_con.close()
     meta_con.close()
