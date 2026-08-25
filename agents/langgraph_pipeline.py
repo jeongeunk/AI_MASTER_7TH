@@ -49,7 +49,7 @@ from agents.db_validation_agent import run_db_validation
 from agents.classification_agent import run_classification
 from agents.report_agent import run_report
 from agents.trace import instrument_agent
-from llm_client import embed, chat
+from llm_client import embed, chat_parsed
 
 load_dotenv()
 
@@ -190,7 +190,7 @@ def meta_no_match_node(state: PipelineState) -> dict:
 @instrument_agent("Meta Search Agent (LLM judge)")
 def meta_judge_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
-    judgment = generate_match_judgment(col, state["current_candidates"], chat_fn=chat)
+    judgment = generate_match_judgment(col, state["current_candidates"], chat_fn=chat_parsed)
     return {"current_judgment": judgment}
 
 

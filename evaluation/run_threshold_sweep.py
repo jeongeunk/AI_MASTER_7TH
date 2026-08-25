@@ -33,7 +33,7 @@ from agents.meta_search_agent import (
     decide_route,
     _fetch_all_columns,
 )
-from llm_client import embed, chat
+from llm_client import embed, chat_parsed
 
 OUTPUT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matching_comparison.csv")
 
@@ -92,7 +92,7 @@ def measure_rag_judgment(con, eval_rows: list) -> dict:
             elapsed_total += time.time() - t0
             continue
 
-        judgment = generate_match_judgment(row, candidates, chat_fn=chat)
+        judgment = generate_match_judgment(row, candidates, chat_fn=chat_parsed)
         route = decide_route(judgment, retrieval_attempts=0)
         counts[route if route in counts else "human_confirm"] += 1
         elapsed_total += time.time() - t0

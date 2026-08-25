@@ -543,6 +543,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
         "raw_file": file_path,
         "parsed_rows": [],
         "failed_rows": [],
+        "all_rows": [],                    # 원본 행 순서 그대로 전체 (성공/확인필요 모두 포함, 업로드 미리보기용)
         "total_count": 0,
         "parse_success_rate": 0.0,
         "candidate_tables": {},
@@ -550,6 +551,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
         "llm_mapping_confidence": {},      # {표준필드: float}
         "llm_mapping_evidence": {},        # {표준필드: str}
         "header_mapping_status": "resolved",  # "resolved" | "failed"
+        "unresolved_header_fields": [],    # 규칙+LLM+담당자 확인까지 다 실패한 표준 필드
     }
 
     # Step 1: 파일 로드 + 헤더 탐지
@@ -600,25 +602,35 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
 
     if unresolved_fields:
         state["header_mapping_status"] = "failed"
-        state["total_count"] = len(df)
-        state["failed_rows"] = [{
-            "row_index": None,
-            "row_data": None,
-            "missing_fields": unresolved_fields,
-        }]
-        return state
+    state["unresolved_header_fields"] = unresolved_fields
 
     # Step 4: 행 단위 구조화 + 스키마 검증
+    # (헤더 단위로 끝내 못 찾은 필드가 있어도 파일 전체를 중단하지 않는다 - 컬럼 단위 실패 ≠ 파일 전체 실패.
+    #  그 필드는 위 for문에서 header_mapping에 없으므로 아래 루프에서 자연히 모든 행이 None으로 채워진다.)
     state["total_count"] = len(df)
+
+    row_meta = {}  # idx -> {"status", "reason", "reason_type"} (all_rows 조립용)
+
+    def _reason_for(missing_fields: list) -> tuple:
+        header_missing = [f for f in missing_fields if f in unresolved_fields]
+        row_missing = [f for f in missing_fields if f not in unresolved_fields]
+        if header_missing and not row_missing:
+            return "header", f"헤더 매핑 실패 — 표준 필드 '{', '.join(header_missing)}'에 해당하는 컬럼을 찾지 못했습니다(규칙+LLM+담당자 확인 모두 실패)"
+        if row_missing and not header_missing:
+            return "row", f"이 행에서 영문명/한글명/항목설명이 전부 비어 있습니다: {', '.join(row_missing)}"
+        return "mixed", f"헤더 매핑 실패({', '.join(header_missing)}) + 이 행 값 누락({', '.join(row_missing)})"
 
     def _finalize_row(idx, row: dict) -> None:
         validation = validate_row_schema(row)
         if not validation["valid"]:
+            reason_type, reason = _reason_for(validation["missing_fields"])
             state["failed_rows"].append({
                 "row_index": idx,
                 "row_data": row,
                 "missing_fields": validation["missing_fields"],
+                "reason_type": reason_type,
             })
+            row_meta[idx] = {"status": "warning", "reason": reason, "reason_type": reason_type}
             return
         # Step 5: 후보 테이블 매핑 (영문명이 있을 때만 - 없으면 조회할 근거가 없음)
         eng_name = row.get("영문명")
@@ -626,6 +638,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
             candidates = map_candidate_tables(str(eng_name).strip())
             state["candidate_tables"][eng_name] = candidates
         state["parsed_rows"].append(row)
+        row_meta[idx] = {"status": "ok", "reason": None, "reason_type": None}
 
     meta_con = None
     pending_completions = []
@@ -672,6 +685,12 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
                 row.update(item["proposed_fill"])
             _finalize_row(idx, row)
 
+    # all_rows 조립: 원본 행 순서 그대로 (완료 후 재확인 반영분까지 전부 반영된 최종 상태)
+    for idx in df.index:
+        row = rows_by_idx[idx]
+        meta = row_meta.get(idx, {"status": "warning", "reason": "처리되지 않음", "reason_type": None})
+        state["all_rows"].append({**row, "row_index": idx, **meta})
+
     state["parse_success_rate"] = (
         len(state["parsed_rows"]) / state["total_count"] if state["total_count"] else 0.0
     )
@@ -686,11 +705,10 @@ if __name__ == "__main__":
 
     print(f"[헤더 매핑 상태] {result['header_mapping_status']}")
     print(f"[헤더 매핑 소스] {result['header_mapping_source']}")
-    if result["header_mapping_status"] == "failed":
-        print(f"[미해결 표준 필드] {result['failed_rows'][0]['missing_fields']}")
-    else:
-        print(f"[총 행 수] {result['total_count']}")
-        print(f"[파싱 성공] {len(result['parsed_rows'])}건 ({result['parse_success_rate']*100:.1f}%)")
-        print(f"[파싱 실패] {len(result['failed_rows'])}건")
-        for f in result["failed_rows"]:
-            print(f"   - row {f['row_index']}: 누락 필드 {f['missing_fields']}")
+    if result["unresolved_header_fields"]:
+        print(f"[헤더 단위로 끝내 못 찾은 표준 필드] {result['unresolved_header_fields']}")
+    print(f"[총 행 수] {result['total_count']}")
+    print(f"[파싱 성공] {len(result['parsed_rows'])}건 ({result['parse_success_rate']*100:.1f}%)")
+    print(f"[확인 필요] {len(result['failed_rows'])}건")
+    for f in result["failed_rows"]:
+        print(f"   - row {f['row_index']} ({f.get('reason_type')}): 누락 필드 {f['missing_fields']}")

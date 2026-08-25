@@ -3,7 +3,7 @@ frontend/pages/2_모니터링.py
 
 Agent 실행 모니터링: 각 Agent(노드)의 시작/종료 시각·소요시간, tool 호출 내역
 (어떤 tool이 불렸는지·소요시간·LLM이면 어떤 모델인지)을 전부 확인할 수 있게 구성.
-- '업로드' 페이지의 '업로드 및 파싱' 단계(Parsing Agent, 동기 호출)와
+- SchemaScout 메인 화면의 '업로드 및 파싱' 단계(Parsing Agent, 동기 호출)와
   파이프라인 시작 이후의 5-Agent 그래프 실행을 모두 여기서 확인한다.
 - 담당자 확인(HITL): inferred_confirmation, type_mismatch_confirmation,
   header_mapping_confirmation, row_completion_confirmation 승인/거절
@@ -17,8 +17,10 @@ import pandas as pd
 import streamlit as st
 
 from api_client import api_client
+from sidebar_progress import render_sidebar_progress
 
 st.set_page_config(page_title="모니터링 - SchemaScout", page_icon="🔍", layout="wide")
+render_sidebar_progress()
 st.title("2. 모니터링")
 
 LEVEL_BADGE = {
@@ -77,11 +79,58 @@ if upload_trace:
 thread_id = st.session_state.get("thread_id")
 if not thread_id:
     if not upload_trace:
-        st.warning("진행 중인 파이프라인이 없습니다. '업로드' 페이지에서 먼저 시작하세요.")
+        st.warning("진행 중인 파이프라인이 없습니다. SchemaScout 메인 화면에서 먼저 시작하세요.")
     st.stop()
 
 st.subheader("🔄 파이프라인 실행 — 5-Agent 그래프")
 st.caption(f"thread_id: `{thread_id}` · 상태/로그는 2초마다 자동 갱신됩니다")
+
+
+STAGE_ORDER = [
+    ("1", "Parsing"),
+    ("2", "Meta Search"),
+    ("3", "DB Validation"),
+    ("4", "Classification"),
+    ("5", "Report"),
+]
+
+
+def _render_stage_summary(events: list, status: str):
+    """참고 화면(에이전트 실행 단계 + 전체 진행률) 컨셉 — plan_step("N/5")을 기준으로
+    5개 Agent 단계를 완료/진행중/대기 카드로 보여주고, 진행률 바 + 핵심 지표를 함께 표시."""
+    seen_steps = [int(ev["plan_step"].split("/")[0]) for ev in events if ev.get("plan_step")]
+    max_step = max(seen_steps) if seen_steps else 0
+
+    cols = st.columns(5)
+    for i, (step_key, label) in enumerate(STAGE_ORDER, start=1):
+        if status == "done" or i < max_step:
+            badge, bg, fg = "완료", "#E8F3E8", "#2E7D32"
+        elif i == max_step and status in ("running", "waiting_human"):
+            badge, bg, fg = ("담당자 확인 대기" if status == "waiting_human" else "진행 중"), \
+                ("#FDF3D9" if status == "waiting_human" else "#E6F1FB"), \
+                ("#8A6D1D" if status == "waiting_human" else "#0C447C")
+        else:
+            badge, bg, fg = "대기", "#F1EFE8", "#5F5E5A"
+        with cols[i - 1]:
+            st.markdown(
+                f"""
+                <div style="background:{bg};border-radius:10px;padding:10px 8px;text-align:center;">
+                    <div style="font-size:11px;color:{fg};margin-bottom:2px;">{i}</div>
+                    <div style="font-size:13px;font-weight:600;color:{fg};margin-bottom:4px;">{label}</div>
+                    <div style="font-size:11px;color:{fg};">{badge}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    progress = min(max_step, 5) / 5 if status != "done" else 1.0
+    st.progress(progress)
+
+    total_tool_calls = sum(len(ev.get("tool_calls") or []) for ev in events)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("완료된 단계", f"{min(max_step, 5)}/5")
+    m2.metric("총 이벤트", len(events))
+    m3.metric("총 tool 호출", total_tool_calls)
 
 
 @st.fragment(run_every=2)
@@ -100,6 +149,9 @@ def _live_pipeline_panel(thread_id: str):
     st.session_state["events"].extend(snapshot["events"])
     st.session_state["events_since"] = snapshot["next_since"]
     status = snapshot["status"]
+
+    _render_stage_summary(st.session_state["events"], status)
+    st.divider()
 
     status_label = {
         "running": "🔵 진행 중",

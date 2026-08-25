@@ -46,6 +46,23 @@ def chat(deployment_env_key: str, messages: list, **kwargs):
     return response
 
 
+def chat_parsed(deployment_env_key: str, messages: list, response_format, **kwargs):
+    """
+    Structured Output 전용 호출. response_format에 Pydantic 모델을 전달하면
+    스키마를 준수하는 응답을 강제하고, resp.choices[0].message.parsed 에
+    검증된 모델 인스턴스를 채워 반환한다(실패/거부 시 parsed는 None, refusal에 사유).
+    """
+    client = get_client()
+    deployment = os.environ[deployment_env_key]
+    response = client.chat.completions.parse(
+        model=deployment,
+        messages=messages,
+        response_format=response_format,
+        **kwargs,
+    )
+    return response
+
+
 def embed(deployment_env_key: str, input_text):
     """
     deployment_env_key 예: "DEPLOYMENT_EMBED_LARGE"

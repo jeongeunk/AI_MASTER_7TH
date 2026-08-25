@@ -121,13 +121,20 @@ def run_classification(validation_results: list) -> list:
         period_result = compare_period(requested, retained)
         out["final_tag"] = period_result["tag"]
         out["final_period"] = period_result["final_period"]
+        out["retention_estimated"] = bool(retention.get("estimated"))
+
+        evidence_prefix = ""
+        if retention.get("estimated"):
+            cols = ", ".join(retention.get("estimated_from") or [])
+            evidence_prefix = f"[보유기간 추정: month 컬럼 없어 {cols} 값으로 추정] "
 
         if row.get("type_match_status") == "mismatch_confirmed":
             out["evidence"] = (
-                f"[type 갱신 승인: {row.get('actual_type')}로 확정] " + period_result["evidence"]
+                f"[type 갱신 승인: {row.get('actual_type')}로 확정] "
+                + evidence_prefix + period_result["evidence"]
             )
         else:
-            out["evidence"] = period_result["evidence"]
+            out["evidence"] = evidence_prefix + period_result["evidence"]
 
         out["source_table"] = row.get("source_table")
 

@@ -182,30 +182,52 @@ RUNS: dict[str, PipelineRun] = {}
 _RUNS_LOCK = threading.Lock()
 
 
-def _run_stream(run: PipelineRun, graph_app, config: dict, resume_command=None):
-    try:
-        stream_input = resume_command if resume_command is not None else {"input_file": run.input_file}
-        for chunk in graph_app.stream(stream_input, config=config, stream_mode="updates"):
-            if "__interrupt__" in chunk:
-                interrupt_obj = chunk["__interrupt__"][0]
-                run.confirm_payload = interrupt_obj.value
-                run.status = "waiting_human"
-                run.resume_event.clear()
-                run.resume_event.wait()  # /confirm 엔드포인트가 set() 할 때까지 대기
-                decision = run.resume_value
-                run.status = "running"
-                run.confirm_payload = None
-                _run_stream(run, graph_app, config, resume_command=Command(resume=decision))
-                return
-            for node_name, update in chunk.items():
-                run.push_event(node_name, update)
+def _run_stream(run: PipelineRun, graph_app, config: dict):
+    """
+    [2차 개정] 1차 개정(재귀 제거 + 명시적 gen.close())으로도 LangSmith 트레이스에는
+    여전히 GeneratorExit가 "비정상 종료"로 기록됐다. 진짜 원인은 close() 자체가
+    아니라 - interrupt 청크를 받자마자 break로 제너레이터를 "덜 쓴 채로" 버렸다는 것.
 
-        final_state = graph_app.get_state(config).values
-        run.report = {
-            "excel_path": final_state.get("report_excel_path"),
-            "stats": final_state.get("report_stats"),
-        }
-        run.status = "done"
+    LangGraph의 stream()은 interrupt()가 걸리면 그 interrupt 청크를 마지막으로
+    스스로 자연 종료된다(재개 입력을 아직 못 받았으니 더 계산할 게 없어서 다음
+    next() 호출에서 StopIteration을 정상적으로 냄). break로 먼저 끊지 않고 그냥
+    한 바퀴 더 돌게(continue) 두면 제너레이터가 스스로 곱게 끝나서 close()도
+    필요 없고, GeneratorExit 자체가 아예 발생하지 않는다 - 이제 LangSmith도
+    이 구간을 정상 종료로 기록한다.
+    """
+    resume_command = None
+    try:
+        while True:
+            stream_input = resume_command if resume_command is not None else {"input_file": run.input_file}
+            interrupted = False
+            for chunk in graph_app.stream(stream_input, config=config, stream_mode="updates"):
+                if "__interrupt__" in chunk:
+                    interrupt_obj = chunk["__interrupt__"][0]
+                    run.confirm_payload = interrupt_obj.value
+                    run.status = "waiting_human"
+                    run.resume_event.clear()
+                    run.resume_event.wait()  # /confirm 엔드포인트가 set() 할 때까지 대기
+                    decision = run.resume_value
+                    run.status = "running"
+                    run.confirm_payload = None
+                    resume_command = Command(resume=decision)
+                    interrupted = True
+                    continue  # break 아님 - 제너레이터가 다음 next()에서 스스로 StopIteration 내며 종료되게 둠
+                for node_name, update in chunk.items():
+                    run.push_event(node_name, update)
+            # for문이 여기까지 왔다는 건 제너레이터가 StopIteration으로 자연 종료됐다는 뜻
+            # (close() 불필요, GeneratorExit 발생 안 함)
+
+            if interrupted:
+                continue  # while 다음 회차에서 재개된 stream() 새로 시작
+
+            final_state = graph_app.get_state(config).values
+            run.report = {
+                "excel_path": final_state.get("report_excel_path"),
+                "stats": final_state.get("report_stats"),
+            }
+            run.status = "done"
+            return
     except Exception as e:  # noqa: BLE001 - 백그라운드 스레드 예외를 상태로 노출
         run.status = "error"
         run.error = str(e)

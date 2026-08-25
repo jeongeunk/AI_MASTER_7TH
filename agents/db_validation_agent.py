@@ -168,6 +168,34 @@ def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_
     con.close()
 
 
+# ── Tool: detect_month_like_columns (보유기간 추정용) ────────
+def detect_month_like_columns(con, table: str) -> list:
+    """
+    'month' 컬럼이 없는 테이블(주로 dim 테이블)에서 시점을 나타낼 것으로
+    추정되는 컬럼을 찾는다. 컬럼명에 'month'가 포함되고, 값이 전부
+    YYYYMM 형태(190001~299912, 뒤 2자리 01~12)인 컬럼만 후보로 인정한다.
+    """
+    candidates = con.execute(
+        "SELECT column_name FROM duckdb_columns() "
+        "WHERE database_name = 'data_db' AND table_name = ? "
+        "AND data_type IN ('BIGINT', 'INTEGER', 'HUGEINT', 'DOUBLE', 'FLOAT') "
+        "AND lower(column_name) LIKE '%month%'",
+        [table],
+    ).fetchall()
+
+    month_like = []
+    for (column_name,) in candidates:
+        total, valid = con.execute(
+            f"SELECT COUNT(*), COUNT(*) FILTER ("
+            f"CAST({column_name} AS BIGINT) BETWEEN 190001 AND 299912 "
+            f"AND CAST({column_name} AS BIGINT) % 100 BETWEEN 1 AND 12"
+            f") FROM data_db.{table} WHERE {column_name} IS NOT NULL"
+        ).fetchone()
+        if total and total == valid:
+            month_like.append(column_name)
+    return month_like
+
+
 # ── Tool: query_retention_period ───────────────────────────
 def query_retention_period(con, table: str, column: str) -> dict:
     with tool_span("query_retention_period"):
@@ -176,11 +204,23 @@ def query_retention_period(con, table: str, column: str) -> dict:
             "WHERE database_name = 'data_db' AND table_name = ? AND column_name = 'month'",
             [table],
         ).fetchone()[0]
-        if not has_month:
-            return {"start": None, "end": None}
+        if has_month:
+            row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{table}").fetchone()
+            return {"start": row[0], "end": row[1], "estimated": False, "estimated_from": None}
 
-        row = con.execute(f"SELECT MIN(month), MAX(month) FROM data_db.{table}").fetchone()
-    return {"start": row[0], "end": row[1]}
+        # month 컬럼이 없는 dim 테이블 등: month로 추정되는 컬럼으로 보유기간 추정
+        month_like_cols = detect_month_like_columns(con, table)
+        if not month_like_cols:
+            return {"start": None, "end": None, "estimated": False, "estimated_from": None}
+
+        union_sql = " UNION ALL ".join(
+            f"SELECT {c} AS m FROM data_db.{table} WHERE {c} IS NOT NULL"
+            for c in month_like_cols
+        )
+        row = con.execute(f"SELECT MIN(m), MAX(m) FROM ({union_sql})").fetchone()
+        start = int(row[0]) if row[0] is not None else None
+        end = int(row[1]) if row[1] is not None else None
+    return {"start": start, "end": end, "estimated": True, "estimated_from": month_like_cols}
 
 
 # ── Tool: execute_readonly_query (Guardrail 적용된 실행기) ──

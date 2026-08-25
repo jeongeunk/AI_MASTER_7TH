@@ -22,8 +22,11 @@ import os
 import sys
 import json
 import sqlite3
+from typing import Literal, Optional
+
 import duckdb
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from rapidfuzz import process as fuzz_process, fuzz
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -172,31 +175,37 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     return candidates[:top_k]
 
 
-# ── Tool: generate_match_judgment (LLM 호출, 신규) ─────────
+# ── Tool: generate_match_judgment (LLM 호출) ────────────────
 _JUDGE_SYSTEM_PROMPT = """너는 통신사 데이터 명세서의 컬럼을 메타 DB 후보와 매칭하는 감사관이다.
 아래 "원본 컬럼 정보"와 "검색된 후보 목록"만 근거로 판단한다.
-후보 목록에 없는 컬럼을 임의로 만들어내지 않는다.
-반드시 다음 JSON 스키마로만 응답한다:
-{
-  "selected_column_id": "후보 중 하나의 column_id 또는 null(적합한 후보 없음)",
-  "confidence": 0.0~1.0,
-  "evidence": "40자 내외, 왜 이 후보를 선택했는지(또는 왜 못 골랐는지)",
-  "recommend_action": "auto_confirm | retry | human_confirm"
-}
+후보 목록에 없는 컬럼을 임의로 만들어내지 않는다(selected_column_id는 후보의 column_id 중 하나이거나,
+적합한 후보가 없으면 null로 응답한다).
 recommend_action 기준:
 - confidence가 매우 높고 후보가 명확히 하나로 좁혀지면 auto_confirm
 - 후보가 여러 개 비슷한 점수이거나 근거가 약하면 retry
-- 그래도 애매하거나 confidence가 낮으면 human_confirm
-다른 텍스트(설명, 코드블록 표시 등)는 절대 포함하지 마라."""
+- 그래도 애매하거나 confidence가 낮으면 human_confirm"""
+
+
+class MatchJudgment(BaseModel):
+    """generate_match_judgment의 Structured Output 스키마. API가 이 형태를 벗어난
+    응답을 만들 수 없도록 강제하므로, 별도의 JSON 파싱/방어 코드가 필요 없다."""
+    selected_column_id: Optional[str] = Field(
+        default=None, description="후보 중 하나의 column_id. 적합한 후보가 없으면 null."
+    )
+    confidence: float = Field(description="0.0~1.0 사이의 확신도")
+    evidence: str = Field(description="40자 내외, 왜 이 후보를 선택했는지(또는 왜 못 골랐는지)")
+    recommend_action: Literal["auto_confirm", "retry", "human_confirm"]
 
 
 def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -> dict:
     """
-    chat_fn: llm_client.chat 을 감싼 함수. None이면 llm_client.chat을 직접 import해서 사용.
+    chat_fn: llm_client.chat_parsed 를 감싼 함수. None이면 llm_client.chat_parsed를
+             직접 import해서 사용. response_format=MatchJudgment로 Structured Output을
+             요청하며, resp.choices[0].message.parsed 에 검증된 인스턴스가 채워진다.
     반환: {selected_column_id, confidence, evidence, recommend_action, hallucination_flag}
     """
     if chat_fn is None:
-        from llm_client import chat as chat_fn  # 지연 import (테스트에서 mock 주입 용이하게)
+        from llm_client import chat_parsed as chat_fn  # 지연 import (테스트에서 mock 주입 용이하게)
 
     candidate_ids = {c["column_id"] for c in candidates}
     payload = {
@@ -225,26 +234,23 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
                 {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
+            response_format=MatchJudgment,
             # gpt-5-mini는 reasoning 계열이라 temperature 커스텀 값을 지원하지 않음
             # (400 Unsupported value: 'temperature' ... Only the default (1) value is supported.)
-            response_format={"type": "json_object"},
         )
-    text = resp.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text.split("\n", 1)[-1] if "\n" in text else text
 
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+    message = resp.choices[0].message
+    judgment = getattr(message, "parsed", None)
+    if judgment is None:
+        reason = getattr(message, "refusal", None) or "Structured Output 응답 없음"
         return {"selected_column_id": None, "confidence": 0.0,
-                "evidence": "LLM 응답 파싱 실패", "recommend_action": "human_confirm",
+                "evidence": f"LLM 응답 파싱 실패: {reason}", "recommend_action": "human_confirm",
                 "hallucination_flag": False}
 
-    selected = parsed.get("selected_column_id")
-    confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
-    evidence = parsed.get("evidence", "")
-    recommend_action = parsed.get("recommend_action", "human_confirm")
+    selected = judgment.selected_column_id
+    confidence = max(0.0, min(1.0, judgment.confidence))
+    evidence = judgment.evidence
+    recommend_action = judgment.recommend_action
     hallucination_flag = False
 
     if selected is not None and selected not in candidate_ids:

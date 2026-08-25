@@ -7,13 +7,15 @@ frontend/pages/3_결과_및_다운로드.py
 import streamlit as st
 
 from api_client import api_client
+from sidebar_progress import render_sidebar_progress
 
 st.set_page_config(page_title="결과 및 다운로드 - SchemaScout", page_icon="📊", layout="wide")
+render_sidebar_progress()
 st.title("3. 결과 및 다운로드")
 
 thread_id = st.session_state.get("thread_id")
 if not thread_id:
-    st.warning("진행 중인 파이프라인이 없습니다. '업로드' 페이지에서 먼저 시작하세요.")
+    st.warning("진행 중인 파이프라인이 없습니다. SchemaScout 메인 화면에서 먼저 시작하세요.")
     st.stop()
 
 try:

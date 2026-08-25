@@ -45,7 +45,10 @@ async def upload_spec(file: UploadFile = File(...)):
         "total_count": result["total_count"],
         "success_count": len(result["parsed_rows"]),
         "fail_count": len(result["failed_rows"]),
-        "failed_rows": result["failed_rows"][:20],  # 실패 사유 확인용 (최대 20건만)
-        "preview": result["parsed_rows"],  # 파싱 성공 전체 표시
-        "trace": result.get("trace_log"),  # 모니터링 화면 표시용: 시작/종료/소요시간 + tool 호출 내역
+        "header_mapping_status": result["header_mapping_status"],
+        "unresolved_header_fields": result["unresolved_header_fields"],
+        "rows": result["all_rows"],          # 원본 행 순서 그대로 전체 (성공/확인필요 모두 포함) - 업로드 화면 통합 표용
+        "failed_rows": result["failed_rows"][:20],  # 하위 호환 (실패 사유만 따로 보고 싶을 때)
+        "preview": result["parsed_rows"],           # 하위 호환 (성공분만 보고 싶을 때)
+        "trace": result.get("trace_log"),    # 모니터링 화면 표시용: 시작/종료/소요시간 + tool 호출 내역
     }

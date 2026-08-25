@@ -8,10 +8,10 @@ LLM 호출은 chat_fn을 mock으로 주입해 실제 API 없이 검증한다.
     pytest tests/test_meta_search_agent.py -v
 """
 
-import json
 from types import SimpleNamespace
 
 from agents.meta_search_agent import (
+    MatchJudgment,
     decide_route,
     expand_retrieval_params,
     generate_match_judgment,
@@ -24,8 +24,9 @@ from agents.meta_search_agent import (
 
 
 def _fake_chat_response(payload_dict: dict):
-    """llm_client.chat()의 반환 형태를 흉내내는 헬퍼"""
-    message = SimpleNamespace(content=json.dumps(payload_dict, ensure_ascii=False))
+    """llm_client.chat_parsed()의 반환 형태를 흉내내는 헬퍼 (Structured Output)"""
+    judgment = MatchJudgment.model_construct(**payload_dict)
+    message = SimpleNamespace(parsed=judgment, refusal=None)
     choice = SimpleNamespace(message=message)
     return SimpleNamespace(choices=[choice])
 
@@ -108,9 +109,10 @@ class TestGenerateMatchJudgment:
         result = generate_match_judgment({"영문명": "SUBS_LINE_CNT"}, self._candidates(), chat_fn=fake_chat)
         assert result["confidence"] == 1.0
 
-    def test_malformed_json_falls_back_to_human_confirm(self):
+    def test_refusal_falls_back_to_human_confirm(self):
+        """Structured Output 요청이 거부되어 parsed가 없는 경우(콘텐츠 정책 등)"""
         def fake_chat(*args, **kwargs):
-            message = SimpleNamespace(content="이건 JSON이 아님")
+            message = SimpleNamespace(parsed=None, refusal="정책상 응답 불가")
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
         result = generate_match_judgment({"영문명": "SUBS_LINE_CNT"}, self._candidates(), chat_fn=fake_chat)
         assert result["recommend_action"] == "human_confirm"
