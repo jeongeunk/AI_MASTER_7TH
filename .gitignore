@@ -31,6 +31,9 @@ outputs/
 .langgraph/
 *.log
 
+# 로컬 참고 문서 (버전관리 대상 아님)
+reference/
+
 # OS
 .DS_Store
 Thumbs.db
