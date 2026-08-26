@@ -42,6 +42,7 @@ Join Resolution Agent
 import os
 import sys
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 
 from dotenv import load_dotenv
@@ -495,6 +496,19 @@ def build_added_key_row(con, missing_key: dict) -> dict:
     }
 
 
+# ── Tool: _resolve_pair_with_own_connection (병렬 워커용) ───
+def _resolve_pair_with_own_connection(table_a: str, table_b: str, edges: list, confirm_fn) -> dict:
+    """이미 등록된 관계로 담당자 확인 없이 확정되는(declared) 쌍 전용 워커.
+    메인 스레드와 커넥션을 공유하면 DuckDB 커넥션 동시 접근 문제가 생기므로
+    워커마다 자기 커넥션을 새로 연다. declared 쌍만 이 경로를 타므로
+    confirm_fn(HITL)이 실제로 호출될 일은 없다(호출되면 안전을 위해 그대로 전달)."""
+    con = get_guarded_connection()
+    try:
+        return resolve_join_for_pair(con, table_a, table_b, edges, confirm_fn=confirm_fn)
+    finally:
+        con.close()
+
+
 # ── 오케스트레이션 ───────────────────────────────────────────
 def run_join_resolution(meta_results: list, confirm_fn=None) -> dict:
     """
@@ -502,6 +516,13 @@ def run_join_resolution(meta_results: list, confirm_fn=None) -> dict:
     matched/auto_confirmed/inferred_confirmed 행들의 source_table을 모아 distinct
     테이블이 2개 이상이면, 모든 테이블 쌍에 대해 조인 가능성을 검증한다.
     테이블이 1개 이하면(단일 테이블 명세서) 조인이 필요 없으므로 빈 결과 반환.
+
+    Parallelization: 테이블 쌍마다 서로 독립적이지만, 새로 추정한 조인키는
+    담당자 확인(interrupt())을 거쳐야 해서 무분별하게 병렬화하면 여러 스레드가
+    동시에 확인을 요청하는 문제가 생긴다. 그래서 "이미 등록된 관계로 확정되는
+    (declared, 담당자 확인 불필요) 쌍"만 스레드풀로 병렬 처리하고, "새로 추정해야
+    하는(inferred, 확인이 필요할 수 있는) 쌍"은 기존처럼 순차 처리한다. 이 데이터셋
+    구조상 대부분의 쌍이 declared라 실질적인 처리시간 단축 효과가 크다.
 
     반환: {"join_results": [...], "meta_results": [...]}
     meta_results는 입력을 그대로 돌려주는 게 기본이지만, 조인에 필요한데 요청 목록에
@@ -520,10 +541,34 @@ def run_join_resolution(meta_results: list, confirm_fn=None) -> dict:
     con.execute("LOAD vss;")
     edges = _load_relationship_edges(con)
 
-    join_results = [
-        resolve_join_for_pair(con, table_a, table_b, edges, confirm_fn=confirm_fn)
-        for table_a, table_b in combinations(tables, 2)
-    ]
+    all_pairs = list(combinations(tables, 2))
+    declared_pairs, inferred_pairs = [], []
+    for table_a, table_b in all_pairs:
+        if find_join_path(edges, table_a, table_b) is not None:
+            declared_pairs.append((table_a, table_b))
+        else:
+            inferred_pairs.append((table_a, table_b))
+
+    results_by_pair = {}
+
+    if declared_pairs:
+        with tool_span(f"resolve_declared_pairs (병렬 {len(declared_pairs)}건)"):
+            with ThreadPoolExecutor(max_workers=min(8, len(declared_pairs))) as executor:
+                futures = {
+                    executor.submit(_resolve_pair_with_own_connection, a, b, edges, confirm_fn): (a, b)
+                    for a, b in declared_pairs
+                }
+                for future in as_completed(futures):
+                    results_by_pair[futures[future]] = future.result()
+
+    for table_a, table_b in inferred_pairs:
+        results_by_pair[(table_a, table_b)] = resolve_join_for_pair(
+            con, table_a, table_b, edges, confirm_fn=confirm_fn
+        )
+
+    # 병렬 실행은 완료 순서가 뒤섞이므로, 매번 리포트 순서가 바뀌지 않도록
+    # 원래 combinations() 순서(테이블명 사전순 쌍)로 재정렬한다.
+    join_results = [results_by_pair[pair] for pair in all_pairs]
 
     updated_meta_results = list(meta_results)
     missing_keys = find_missing_join_key_columns(join_results, meta_results)

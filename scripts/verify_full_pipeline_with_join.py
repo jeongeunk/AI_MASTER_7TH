@@ -35,6 +35,8 @@ def auto_confirm(payload: dict):
         return {"decision": "approved", "selected_column": suggested} if suggested else {"decision": "rejected"}
     if ptype == "row_completion_confirmation":
         return {"decision": "approved", "approved_row_indices": [c["row_index"] for c in payload["candidates"]]}
+    if ptype == "table_disambiguation_confirmation":
+        return {"decision": "approved", "selected_table_id": payload["candidates"][0]["table_id"]}
     return "approved"
 
 

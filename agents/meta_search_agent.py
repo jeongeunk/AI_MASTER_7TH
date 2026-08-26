@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal, Optional
 
 import duckdb
@@ -459,20 +460,81 @@ def _enrich_relationships(con, result: dict) -> dict:
     return result
 
 
+# ── Tool: 병렬 프리페치 워커 (담당자 확인이 필요 없는 순수 조회/API 호출만) ──
+def _exact_match_with_own_connection(row: dict) -> tuple:
+    """단일 행에 대해 자기만의 DuckDB 커넥션으로 정확 매칭 조회 - 병렬 워커용.
+    담당자 확인이 전혀 개입하지 않는 순수 조회라 여러 행을 동시에 처리해도 안전하다."""
+    con = duckdb.connect(META_DB_PATH)
+    try:
+        eng_name = str(row["영문명"]).strip()
+        return eng_name, exact_match_meta_db(con, eng_name)
+    finally:
+        con.close()
+
+
+def _prefetch_candidates_and_judgment(row: dict, embed_fn, chat_fn) -> tuple:
+    """영문명이 정확 매칭되지 않은 행에 대해, 1차 시도(top_k=5, 기본 floor) 기준
+    후보 검색(임베딩 API 호출)과 LLM 판단까지 미리 계산해둔다. 둘 다 담당자 확인이
+    필요 없는 순수 API 호출이고, 네트워크 I/O 대기 구간에서는 GIL이 풀리므로
+    스레드로 여러 행을 동시에 처리하면 실제로 총 대기시간이 겹쳐서 줄어든다
+    (DuckDB 내부 쿼리처럼 짧고 인프로세스인 작업과 달리 이 구간은 실측으로 효과를 확인함).
+    재검색(retry)이 필요한 경우는 이 프리페치 결과를 버리고 순차 루프에서 다시 계산한다."""
+    con = duckdb.connect(META_DB_PATH)
+    con.execute("LOAD vss;")
+    try:
+        eng_name = str(row["영문명"]).strip()
+        candidates = retrieve_candidates(
+            con, eng_name, str(row["항목설명"]), embed_fn,
+            top_k=5, floor=SIMILARITY_PREFILTER_FLOOR, include_glossary_boost=False,
+        )
+        judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn) if candidates else None
+        return candidates, judgment
+    finally:
+        con.close()
+
+
 # ── 오케스트레이션 (단독 실행용 — LangGraph 없이 순수 파이썬 루프) ──
 def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) -> list:
     """
     parsed_rows: parsing_agent.run_parsing(...)의 state['parsed_rows']
     반환: 각 행에 match_status, resolution_path, table_relationships 등이 추가된 결과 리스트
     (matched / auto_confirmed / inferred_confirmed 만 다음 단계로 넘어갈 대상, unresolved는 여기서 종결)
+
+    Parallelization: 행마다 서로 독립적이지만, 애매한 경우(동일 컬럼명 중복, 확신도
+    애매)는 담당자 확인(interrupt() 가능성)을 거쳐야 해서 무분별하게 병렬화하면 여러
+    스레드가 동시에 확인을 요청하는 문제가 생긴다. 그래서 담당자 확인이 절대 개입하지
+    않는 두 구간만 병렬 프리페치한다: ① 전체 행의 정확 매칭 조회, ② 정확 매칭 실패한
+    행들의 1차 후보 검색 + LLM 판단. 이후 라우팅 적용·재검색·담당자 확인은 원래
+    순서대로 순차 처리해 기존 동작을 그대로 보존한다. 이 함수는 LangGraph 그래프의
+    인터랙티브 노드(agents/langgraph_pipeline.py)와는 별개의 단독 실행용 오케스트레이터라
+    interrupt() 순차 재개 모델과 충돌할 위험이 없다.
     """
     con = duckdb.connect(META_DB_PATH)
     con.execute("LOAD vss;")
 
+    with tool_span(f"exact_match_meta_db (병렬 {len(parsed_rows)}건)"):
+        with ThreadPoolExecutor(max_workers=min(8, len(parsed_rows)) or 1) as executor:
+            exact_by_index = list(executor.map(_exact_match_with_own_connection, parsed_rows))
+
+    need_retrieval_indices = [
+        i for i, (_, exact) in enumerate(exact_by_index)
+        if not exact["found"] and not exact.get("ambiguous")
+    ]
+
+    prefetched = {}  # index -> (candidates, judgment)
+    if need_retrieval_indices:
+        with tool_span(f"prefetch_candidates_and_judgment (병렬 {len(need_retrieval_indices)}건)"):
+            with ThreadPoolExecutor(max_workers=min(8, len(need_retrieval_indices))) as executor:
+                futures = {
+                    executor.submit(_prefetch_candidates_and_judgment, parsed_rows[i], embed_fn, chat_fn): i
+                    for i in need_retrieval_indices
+                }
+                for future in as_completed(futures):
+                    prefetched[futures[future]] = future.result()
+
     results = []
-    for row in parsed_rows:
-        eng_name = str(row["영문명"]).strip()
-        exact = exact_match_meta_db(con, eng_name)
+    for i, row in enumerate(parsed_rows):
+        eng_name, exact = exact_by_index[i]
 
         if exact["found"]:
             out = {**row, "match_status": "matched", "meta_row": exact["meta_row"],
@@ -499,14 +561,24 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                 results.append(out)
             continue
 
+        # 1차 시도(top_k=5, 기본 floor)는 위에서 병렬로 미리 계산해둔 값을 재사용한다.
+        # 재검색(retry)부터는 캐시가 없으므로 이전과 동일하게 그때그때 새로 계산한다.
+        cached = prefetched.get(i)
+
         attempts = 0
         top_k, floor, glossary_boost = 5, SIMILARITY_PREFILTER_FLOOR, False
         resolved = False
         while not resolved:
-            candidates = retrieve_candidates(
-                con, eng_name, str(row["항목설명"]), embed_fn,
-                top_k=top_k, floor=floor, include_glossary_boost=glossary_boost,
-            )
+            if cached is not None:
+                candidates, judgment = cached
+                cached = None
+            else:
+                candidates = retrieve_candidates(
+                    con, eng_name, str(row["항목설명"]), embed_fn,
+                    top_k=top_k, floor=floor, include_glossary_boost=glossary_boost,
+                )
+                judgment = None
+
             if not candidates:
                 out = {**row, "match_status": "unresolved", "meta_row": None,
                        "match_evidence": "검색된 후보 없음", "unresolved_reason": "no_match",
@@ -515,7 +587,8 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                 resolved = True
                 break
 
-            judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn)
+            if judgment is None:
+                judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn)
             route = decide_route(judgment, attempts)
 
             if route == "auto_confirm":

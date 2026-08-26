@@ -31,8 +31,9 @@ outputs/
 .langgraph/
 *.log
 
-# 로컬 참고 문서 (버전관리 대상 아님)
+# 로컬 참고 문서/산출물 (버전관리 대상 아님)
 reference/
+산출물/
 
 # OS
 .DS_Store
