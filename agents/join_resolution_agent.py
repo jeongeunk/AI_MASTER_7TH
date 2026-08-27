@@ -401,7 +401,7 @@ def find_missing_join_key_columns(join_results: list, meta_results: list) -> lis
     """
     requested_columns = {
         r["meta_row"]["column_name"] for r in meta_results
-        if r.get("match_status") in ("matched", "auto_confirmed", "inferred_confirmed") and r.get("meta_row")
+        if r.get("match_status") in ("matched", "inferred_confirmed") and r.get("meta_row")
     }
 
     missing = {}  # key_column -> {"tables": set, "needed_for": set of (table_a, table_b)}
@@ -513,7 +513,7 @@ def _resolve_pair_with_own_connection(table_a: str, table_b: str, edges: list, c
 def run_join_resolution(meta_results: list, confirm_fn=None) -> dict:
     """
     meta_results: meta_search_agent.run_meta_search(...) 결과.
-    matched/auto_confirmed/inferred_confirmed 행들의 source_table을 모아 distinct
+    matched/inferred_confirmed 행들의 source_table을 모아 distinct
     테이블이 2개 이상이면, 모든 테이블 쌍에 대해 조인 가능성을 검증한다.
     테이블이 1개 이하면(단일 테이블 명세서) 조인이 필요 없으므로 빈 결과 반환.
 
@@ -532,7 +532,7 @@ def run_join_resolution(meta_results: list, confirm_fn=None) -> dict:
     """
     tables = sorted({
         r["meta_row"]["table_id"] for r in meta_results
-        if r.get("match_status") in ("matched", "auto_confirmed", "inferred_confirmed") and r.get("meta_row")
+        if r.get("match_status") in ("matched", "inferred_confirmed") and r.get("meta_row")
     })
     if len(tables) < 2:
         return {"join_results": [], "meta_results": meta_results}

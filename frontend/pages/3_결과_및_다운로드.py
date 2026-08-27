@@ -32,7 +32,7 @@ stats = result["stats"]
 if stats:
     col1, col2 = st.columns(2)
     col1.metric("전체 컬럼 수", stats["total"])
-    col2.metric("자동 확정 건수", stats["auto_confirm_count"])
+    col2.metric("정상 검증 건수", stats["resolution_path_counts"].get("validated", 0))
 
     with st.expander("태그별 분포"):
         st.bar_chart(stats["tag_counts"])

@@ -25,6 +25,7 @@ import pandas as pd
 
 from agents.langgraph_pipeline import build_graph, CHECKPOINT_DB_PATH
 from agents.report_agent import aggregate_results, _compute_tag_label
+from backend.core.metrics_store import log_run_metrics
 
 
 def _json_safe(value):
@@ -47,7 +48,6 @@ NODE_METADATA = {
     "meta_retrieve": {"label": "다중소스 후보 검색", "tool": "retrieve_candidates (vss column + vss glossary + fuzzy)", "model": "text-embedding-3-large", "level": "step", "plan_step": "2/6"},
     "meta_no_match": {"label": "매칭 후보 없음 처리", "tool": "unresolved(no_match) 기록", "model": None, "level": "step", "plan_step": "2/6"},
     "meta_judge": {"label": "AI 매칭 판단", "tool": "generate_match_judgment", "model": "gpt-5-mini", "level": "decision", "plan_step": "2/6"},
-    "meta_auto_confirm": {"label": "자동 확정", "tool": "update_meta_tag / log_auto_confirm", "model": None, "level": "step", "plan_step": "2/6"},
     "meta_retry": {"label": "재검색 준비", "tool": "expand_retrieval_params", "model": None, "level": "self_correction", "plan_step": "2/6"},
     "meta_human_confirm": {"label": "담당자 확인 대기", "tool": "request_inferred_confirmation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
     "meta_table_disambiguation": {"label": "테이블 선택 대기", "tool": "request_table_disambiguation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
@@ -91,10 +91,8 @@ def _summarize_update(node_name: str, update: dict) -> str:
         return (
             f"Decision — LLM(gpt-5-mini) 근거: \"{j.get('evidence', '')}\" "
             f"→ 확신도 {j.get('confidence')} → 라우팅: {j.get('recommend_action')} "
-            f"(≥0.92 auto_confirm / <0.70 human_confirm / 그 사이는 retry)"
+            f"(추정 매칭은 확신도 무관 항상 담당자 확인 — 0.70~0.92는 재검색 후 확인, 그 외는 즉시 확인)"
         )
-    if node_name == "meta_auto_confirm":
-        return "확신도 임계값(0.92) 이상 → 담당자 확인 없이 자동 확정"
     if node_name == "meta_retry":
         return f"Self-Correction — 확신도 부족 → 검색 파라미터 확장(top_k↑, floor↓) 후 재검색 ({update.get('retrieval_attempts')}/2회차)"
     if node_name == "meta_no_match":
@@ -139,6 +137,7 @@ class PipelineRun:
         self.report = None
         self.error = None
         self._last_event_time = time.time()
+        self.started_at = self._last_event_time
 
     def push_event(self, node_name: str, update: dict):
         meta = NODE_METADATA.get(node_name, {"label": node_name, "tool": node_name, "model": None, "level": "step", "plan_step": None})
@@ -247,6 +246,11 @@ def _run_stream(run: PipelineRun, graph_app, config: dict):
                 "excel_path": final_state.get("report_excel_path"),
                 "stats": final_state.get("report_stats"),
             }
+            run_completed_at = time.time()
+            log_run_metrics(
+                run.thread_id, run.input_file, final_state.get("meta_results", []),
+                run.started_at, run_completed_at,
+            )
             run.status = "done"
             return
     except Exception as e:  # noqa: BLE001 - 백그라운드 스레드 예외를 상태로 노출

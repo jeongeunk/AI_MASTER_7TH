@@ -1,7 +1,9 @@
 """
 Meta Search Agent 단위 테스트 (RAG 전환판)
 
-SC-002 개정판(다중소스 검색 + LLM 판단 + 3단계 분기) 대응.
+SC-002 개정판(다중소스 검색 + LLM 판단 + 2단계 분기: 재검색/담당자확인) 대응.
+추정 매칭은 confidence 크기와 무관하게 항상 담당자 확인을 거치므로(자동 확정 경로 없음),
+decide_route는 "retry"와 "human_confirm" 두 값만 반환한다.
 LLM 호출은 chat_fn을 mock으로 주입해 실제 API 없이 검증한다.
 
 실행:
@@ -17,7 +19,7 @@ from agents.meta_search_agent import (
     generate_match_judgment,
     apply_confirmation_result,
     fuzzy_match_candidates,
-    AUTO_CONFIRM_CONFIDENCE,
+    HIGH_CONFIDENCE_SKIP_RETRY,
     RETRY_CONFIDENCE_FLOOR,
     MAX_RETRIEVAL_ATTEMPTS,
 )
@@ -32,20 +34,20 @@ def _fake_chat_response(payload_dict: dict):
 
 
 class TestDecideRoute:
-    def test_high_confidence_auto_confirms(self):
-        judgment = {"confidence": AUTO_CONFIRM_CONFIDENCE}
-        assert decide_route(judgment, retrieval_attempts=0) == "auto_confirm"
+    def test_high_confidence_skips_retry_but_still_needs_human(self):
+        judgment = {"confidence": HIGH_CONFIDENCE_SKIP_RETRY}
+        assert decide_route(judgment, retrieval_attempts=0) == "human_confirm"
 
-    def test_exactly_at_auto_confirm_threshold(self):
-        judgment = {"confidence": AUTO_CONFIRM_CONFIDENCE}
-        assert decide_route(judgment, retrieval_attempts=0) == "auto_confirm"
+    def test_exactly_at_skip_retry_threshold(self):
+        judgment = {"confidence": HIGH_CONFIDENCE_SKIP_RETRY}
+        assert decide_route(judgment, retrieval_attempts=0) == "human_confirm"
 
     def test_mid_confidence_retries_when_attempts_remain(self):
-        judgment = {"confidence": (AUTO_CONFIRM_CONFIDENCE + RETRY_CONFIDENCE_FLOOR) / 2}
+        judgment = {"confidence": (HIGH_CONFIDENCE_SKIP_RETRY + RETRY_CONFIDENCE_FLOOR) / 2}
         assert decide_route(judgment, retrieval_attempts=0) == "retry"
 
     def test_mid_confidence_falls_back_to_human_when_attempts_exhausted(self):
-        judgment = {"confidence": (AUTO_CONFIRM_CONFIDENCE + RETRY_CONFIDENCE_FLOOR) / 2}
+        judgment = {"confidence": (HIGH_CONFIDENCE_SKIP_RETRY + RETRY_CONFIDENCE_FLOOR) / 2}
         assert decide_route(judgment, retrieval_attempts=MAX_RETRIEVAL_ATTEMPTS) == "human_confirm"
 
     def test_low_confidence_goes_straight_to_human(self):
@@ -80,7 +82,7 @@ class TestGenerateMatchJudgment:
         def fake_chat(*args, **kwargs):
             return _fake_chat_response({
                 "selected_column_id": "col_001", "confidence": 0.95,
-                "evidence": "설명이 일치함", "recommend_action": "auto_confirm",
+                "evidence": "설명이 일치함", "recommend_action": "retry",
             })
         result = generate_match_judgment({"영문명": "SUBS_LINE_CNT"}, self._candidates(), chat_fn=fake_chat)
         assert result["selected_column_id"] == "col_001"
@@ -92,7 +94,7 @@ class TestGenerateMatchJudgment:
         def fake_chat(*args, **kwargs):
             return _fake_chat_response({
                 "selected_column_id": "col_999_존재하지않음", "confidence": 0.99,
-                "evidence": "그럴듯한 근거", "recommend_action": "auto_confirm",
+                "evidence": "그럴듯한 근거", "recommend_action": "retry",
             })
         result = generate_match_judgment({"영문명": "SUBS_LINE_CNT"}, self._candidates(), chat_fn=fake_chat)
         assert result["hallucination_flag"] is True
@@ -104,7 +106,7 @@ class TestGenerateMatchJudgment:
         def fake_chat(*args, **kwargs):
             return _fake_chat_response({
                 "selected_column_id": "col_001", "confidence": 1.4,
-                "evidence": "근거", "recommend_action": "auto_confirm",
+                "evidence": "근거", "recommend_action": "retry",
             })
         result = generate_match_judgment({"영문명": "SUBS_LINE_CNT"}, self._candidates(), chat_fn=fake_chat)
         assert result["confidence"] == 1.0

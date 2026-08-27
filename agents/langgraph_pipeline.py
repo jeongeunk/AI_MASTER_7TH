@@ -2,15 +2,17 @@
 SchemaScout LangGraph 파이프라인 (conditional_edge 전환판)
 
 5개 Agent(Parsing -> Meta Search -> DB Validation -> Classification -> Report)를
-하나의 StateGraph로 연결한다. Meta Search 단계는 컬럼 단위로 아래 6개 노드를 돌며
-add_conditional_edges로 자동확정/재검색/담당자확인 3갈래를 그래프 레벨에서 분기한다.
+하나의 StateGraph로 연결한다. Meta Search 단계는 컬럼 단위로 아래 노드를 돌며
+add_conditional_edges로 재검색/담당자확인 갈래를 그래프 레벨에서 분기한다.
+추정 매칭(정확 매칭이 아닌 경우)은 confidence 크기와 무관하게 항상 담당자 확인을
+거친다 - 자동 확정 경로는 없다(고위험 결정이라 LLM 자기 확신도만으로 통과시키지 않음).
 
     meta_exact_check -> (단일 매칭: 다음 컬럼 또는 join_resolution / 동일 컬럼명이 여러
                           테이블에 존재(ambiguous): meta_table_disambiguation / 매칭 없음: meta_retrieve)
     meta_retrieve -> (후보 없음: meta_no_match / 있음: meta_judge)
-    meta_judge -> (auto_confirm / retry / human_confirm)
+    meta_judge -> (retry / human_confirm)
     meta_retry -> meta_retrieve (재검색 루프, 최대 MAX_RETRIEVAL_ATTEMPTS회)
-    meta_auto_confirm / meta_human_confirm / meta_no_match / meta_table_disambiguation
+    meta_human_confirm / meta_no_match / meta_table_disambiguation
         -> (다음 컬럼 또는 join_resolution)
 
 담당자 확인(interrupt/inferred)과 type 불일치 확인(interrupt/db_validation)은 기존과
@@ -43,9 +45,9 @@ from agents.meta_search_agent import (
     request_table_disambiguation,
     apply_confirmation_result,
     update_meta_tag,
-    log_auto_confirm,
     log_confirmation_to_audit,
     get_table_relationships,
+    persist_confirmed_mapping_example,
     SIMILARITY_PREFILTER_FLOOR,
 )
 from agents.join_resolution_agent import run_join_resolution
@@ -140,6 +142,7 @@ def meta_exact_check_node(state: PipelineState) -> dict:
         out = {**col, "match_status": "matched", "meta_row": exact["meta_row"],
                "match_evidence": "영문명 정확 매칭", "resolution_path": "validated"}
         out = _enrich(con, out)
+        persist_confirmed_mapping_example(con, out, embed)
         con.close()
         return {
             "meta_results": state["meta_results"] + [out],
@@ -186,6 +189,7 @@ def meta_table_disambiguation_node(state: PipelineState) -> dict:
                                   f"({', '.join(table_ids)})에 존재해 담당자가 {selected['table_id']} 선택",
                "resolution_path": "validated"}
         out = _enrich(con, out)
+        persist_confirmed_mapping_example(con, out, embed)
     else:
         out = {**col, "match_status": "unresolved", "meta_row": None,
                "match_evidence": f"동일 컬럼명이 {len(table_ids)}개 테이블({', '.join(table_ids)})에 존재하나 "
@@ -221,7 +225,7 @@ def meta_no_match_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     out = {**col, "match_status": "unresolved", "meta_row": None,
            "match_evidence": "검색된 후보 없음", "unresolved_reason": "no_match",
-           "resolution_path": "no_match"}
+           "resolution_path": "no_match", "retrieval_attempts": state["retrieval_attempts"]}
     return {
         "meta_results": state["meta_results"] + [out],
         "meta_index": state["meta_index"] + 1,
@@ -237,27 +241,6 @@ def meta_judge_node(state: PipelineState) -> dict:
 
 def route_by_judgment(state: PipelineState) -> str:
     return decide_route(state["current_judgment"], state["retrieval_attempts"])
-
-
-@instrument_agent("Meta Search Agent (auto confirm)")
-def meta_auto_confirm_node(state: PipelineState) -> dict:
-    col = state["meta_columns"][state["meta_index"]]
-    judgment = state["current_judgment"]
-    selected = next(c for c in state["current_candidates"] if c["column_id"] == judgment["selected_column_id"])
-
-    con = _get_meta_con()
-    update_meta_tag(con, selected["column_id"], "auto_confirmed", confidence=judgment["confidence"])
-    log_auto_confirm(selected["column_id"], str(col["영문명"]), judgment["confidence"], judgment["evidence"])
-    out = {**col, "match_status": "auto_confirmed", "meta_row": selected["meta_row"],
-           "match_evidence": judgment["evidence"], "llm_confidence": judgment["confidence"],
-           "llm_evidence": judgment["evidence"], "resolution_path": "auto_confirmed"}
-    out = _enrich(con, out)
-    con.close()
-
-    return {
-        "meta_results": state["meta_results"] + [out],
-        "meta_index": state["meta_index"] + 1,
-    }
 
 
 @instrument_agent("Meta Search Agent (self-correction retry)")
@@ -295,14 +278,16 @@ def meta_human_confirm_node(state: PipelineState) -> dict:
         update_meta_tag(con, selected["column_id"], "inferred_confirmed", confidence=judgment["confidence"])
         out = {**col, "match_status": "inferred_confirmed", "meta_row": selected["meta_row"],
                "match_evidence": judgment["evidence"], "llm_confidence": judgment["confidence"],
-               "llm_evidence": judgment["evidence"], "resolution_path": "validated"}
+               "llm_evidence": judgment["evidence"], "resolution_path": "validated",
+               "retrieval_attempts": state["retrieval_attempts"]}
         out = _enrich(con, out)
+        persist_confirmed_mapping_example(con, out, embed)
     else:
         if target_column_id:
             update_meta_tag(con, target_column_id, "unresolved", confidence=judgment["confidence"])
         out = {**col, "match_status": "unresolved", "meta_row": None,
                "match_evidence": "담당자 확인 결과 거절", "unresolved_reason": "rejected_by_human",
-               "resolution_path": "rejected_by_human"}
+               "resolution_path": "rejected_by_human", "retrieval_attempts": state["retrieval_attempts"]}
     con.close()
 
     return {
@@ -357,7 +342,6 @@ def build_graph():
     graph.add_node("meta_retrieve", meta_retrieve_node)
     graph.add_node("meta_no_match", meta_no_match_node)
     graph.add_node("meta_judge", meta_judge_node)
-    graph.add_node("meta_auto_confirm", meta_auto_confirm_node)
     graph.add_node("meta_retry", meta_retry_node)
     graph.add_node("meta_human_confirm", meta_human_confirm_node)
     graph.add_node("meta_table_disambiguation", meta_table_disambiguation_node)
@@ -381,11 +365,11 @@ def build_graph():
     )
     graph.add_conditional_edges(
         "meta_judge", route_by_judgment,
-        {"auto_confirm": "meta_auto_confirm", "retry": "meta_retry", "human_confirm": "meta_human_confirm"},
+        {"retry": "meta_retry", "human_confirm": "meta_human_confirm"},
     )
     graph.add_edge("meta_retry", "meta_retrieve")
 
-    for node_name in ("meta_auto_confirm", "meta_human_confirm", "meta_no_match", "meta_table_disambiguation"):
+    for node_name in ("meta_human_confirm", "meta_no_match", "meta_table_disambiguation"):
         graph.add_conditional_edges(
             node_name, route_after_resolution,
             {"next_column": "meta_exact_check", "done": "join_resolution"},

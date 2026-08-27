@@ -1,14 +1,16 @@
 """
 Meta Search Agent (RAG 전환판)
 
-역할: 컬럼(영문명/한글명/항목설명)을 메타 DB와 대조하여 matched/auto_confirmed/
+역할: 컬럼(영문명/한글명/항목설명)을 메타 DB와 대조하여 matched/
       inferred_confirmed/unresolved 판정.
 - 정확 매칭 실패 시 다중소스 검색(컬럼 임베딩 + 용어집 임베딩 + 문자열 유사도)으로
   후보를 모으고, LLM(gpt-5-mini)이 후보 중 최적 매칭·확신도·근거를 생성한다.
-- 확신도 >= AUTO_CONFIRM_CONFIDENCE  -> 담당자 확인 없이 자동 확정(auto_confirmed)
-  확신도 in [RETRY_CONFIDENCE_FLOOR, AUTO_CONFIRM_CONFIDENCE) 이고 재검색 여지 있음
-                                     -> 검색 조건을 넓혀 재검색(최대 MAX_RETRIEVAL_ATTEMPTS회)
-  그 외                              -> 담당자 확인(interrupt)
+- 추정된 매칭(정확 매칭이 아닌 모든 경우)은 confidence 크기와 무관하게 반드시
+  담당자 확인(interrupt)을 거친다 — 잘못된 매칭 하나가 명세서 전체 신뢰도에 영향을
+  주는 고위험 결정이라, LLM 자기 확신도만으로 자동 확정하는 경로를 두지 않는다.
+  confidence in [RETRY_CONFIDENCE_FLOOR, HIGH_CONFIDENCE_SKIP_RETRY) 이고 재검색
+  여지가 있으면 검색 조건을 넓혀 재검색(최대 MAX_RETRIEVAL_ATTEMPTS회)한 뒤 담당자
+  확인으로 넘어가고, 그 외에는 재검색 없이 바로 담당자 확인으로 간다.
 - 거절 시 unresolved로 즉시 확정하고 메타 DB에 직접 기록 (DB Validation/Classification 미경유)
 
 주의: 이 파일은 LangGraph interrupt() 없이 단독 실행 가능하도록
@@ -40,7 +42,12 @@ AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
 # ── 확신도/재검색 파라미터 (임계값 단일값 0.75/0.85 불일치를 대체) ──────────
 SIMILARITY_PREFILTER_FLOOR = 0.75   # retrieve_candidates 1차 후보 필터 cosine 컷오프
-AUTO_CONFIRM_CONFIDENCE = 0.92      # 이 이상이면 담당자 확인 없이 자동 확정
+# 추정 매칭은 confidence와 무관하게 항상 담당자 확인을 거친다(자동 확정 경로 없음).
+# 이 값은 "안전하게 자동 통과시킬 기준"이 아니라 "재검색을 한 번 더 시도할 가치가
+# 있는지"만 가르는 재검색 상한선이다 — 잘못 정해도 최악의 경우 불필요한 재검색
+# 1회일 뿐, 최종 결과는 어차피 담당자가 확인하므로 AUTO_CONFIRM_CONFIDENCE였을 때와
+# 달리 실측 검증이 시급한 고위험 파라미터는 아니다.
+HIGH_CONFIDENCE_SKIP_RETRY = 0.92   # 이 이상이면 재검색 없이 바로 담당자 확인
 RETRY_CONFIDENCE_FLOOR = 0.70       # 이 미만이면 재검색 없이 바로 담당자 확인
 MAX_RETRIEVAL_ATTEMPTS = 2          # 재검색 최대 횟수
 
@@ -105,8 +112,9 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                          include_glossary_boost: bool = False) -> list:
     """
     column_embeddings(vss) + glossary_embeddings(vss, linked_column_id 있는 것만) +
-    문자열 유사도(fuzzy)를 병합해 후보 top_k를 반환한다.
-    각 후보: {column_id, source: 'vss_column'|'vss_glossary'|'fuzzy', score, meta_row}
+    confirmed_mapping_embeddings(vss, Episodic Memory) + 문자열 유사도(fuzzy)를
+    병합해 후보 top_k를 반환한다.
+    각 후보: {column_id, source: 'vss_column'|'vss_glossary'|'confirmed_mapping'|'fuzzy', score, meta_row}
     """
     with tool_span("embed (retrieve_candidates)", model="text-embedding-3-large"):
         resp = embed_fn("DEPLOYMENT_EMBED_LARGE", description)
@@ -171,7 +179,39 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
         # glossary_embeddings가 아직 채워지지 않은 초기 환경에서도 파이프라인이 죽지 않도록 방어
         pass
 
-    # 3) 문자열 유사도 (오탈자·표기 변형)
+    # 3) 과거 확정 매핑 사례(Episodic Memory) — validated(정확 매칭/담당자 승인)만 누적되어 있음.
+    #    auto_confirmed는 사람이 검증한 적이 없어 여기 포함되지 않는다(persist_confirmed_mapping_example 참고).
+    #    사람이 이미 검증한 사례라 컬럼 설명 임베딩과 동일한 floor로 취급한다(glossary처럼 낮춰주지 않음).
+    try:
+        with tool_span("vss_search (confirmed_mapping_embeddings)"):
+            conf_rows = con.execute(
+                """
+                SELECT cme.column_id,
+                       array_cosine_distance(cmeb.embedding, ?::FLOAT[3072]) AS distance
+                FROM confirmed_mapping_embeddings cmeb
+                JOIN confirmed_mapping_examples cme ON cmeb.example_id = cme.example_id
+                ORDER BY distance ASC
+                LIMIT ?
+                """,
+                [query_vec, max(top_k * 2, 5)],
+            ).fetchall()
+        for r in conf_rows:
+            similarity = 1 - r[1]
+            if similarity < floor:
+                continue
+            meta_row_q = con.execute(
+                "SELECT column_id, table_id, column_name, data_type, description FROM column_spec WHERE column_id = ?",
+                [r[0]],
+            ).fetchone()
+            if meta_row_q:
+                meta_row = {"column_id": meta_row_q[0], "table_id": meta_row_q[1], "column_name": meta_row_q[2],
+                            "data_type": meta_row_q[3], "description": meta_row_q[4]}
+                _consider(r[0], similarity, "confirmed_mapping", meta_row)
+    except duckdb.Error:
+        # confirmed_mapping_embeddings가 아직 생성되지 않은 초기 환경(첫 실행)에서도 죽지 않도록 방어
+        pass
+
+    # 4) 문자열 유사도 (오탈자·표기 변형)
     with tool_span("fuzzy_match_candidates"):
         all_columns = _fetch_all_columns(con)
         fuzzy_results = fuzzy_match_candidates(eng_name, all_columns, top_k=top_k)
@@ -192,10 +232,13 @@ _JUDGE_SYSTEM_PROMPT = """너는 통신사 데이터 명세서의 컬럼을 메�
 아래 "원본 컬럼 정보"와 "검색된 후보 목록"만 근거로 판단한다.
 후보 목록에 없는 컬럼을 임의로 만들어내지 않는다(selected_column_id는 후보의 column_id 중 하나이거나,
 적합한 후보가 없으면 null로 응답한다).
+후보의 source가 confirmed_mapping이면, 과거에 이미 정확 매칭되었거나 담당자가 직접 승인한 사례이므로
+다른 source(vss_column/vss_glossary/fuzzy)보다 더 신뢰하고 판단한다.
+confidence가 아무리 높아도 이 판단은 항상 담당자 확인을 거치므로(자동 확정 없음), recommend_action은
+"확정"의 의미가 아니라 "담당자에게 보여주기 전에 검색을 더 해볼 가치가 있는가"만 나타낸다.
 recommend_action 기준:
-- confidence가 매우 높고 후보가 명확히 하나로 좁혀지면 auto_confirm
-- 후보가 여러 개 비슷한 점수이거나 근거가 약하면 retry
-- 그래도 애매하거나 confidence가 낮으면 human_confirm"""
+- 확신도가 낮거나 후보가 여러 개 비슷한 점수, 근거가 약하면 retry
+- confidence가 높아 재검색이 불필요하거나, 이미 애매하면(재검색해도 개선 여지 없음) human_confirm"""
 
 
 class MatchJudgment(BaseModel):
@@ -206,7 +249,7 @@ class MatchJudgment(BaseModel):
     )
     confidence: float = Field(description="0.0~1.0 사이의 확신도")
     evidence: str = Field(description="40자 내외, 왜 이 후보를 선택했는지(또는 왜 못 골랐는지)")
-    recommend_action: Literal["auto_confirm", "retry", "human_confirm"]
+    recommend_action: Literal["retry", "human_confirm"]
 
 
 def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -> dict:
@@ -284,14 +327,14 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
 
 # ── Tool: decide_route (route_by_judgment의 순수함수 버전) ─
 def decide_route(judgment: dict, retrieval_attempts: int) -> str:
+    """추정 매칭(정확 매칭이 아닌 경우)은 confidence와 무관하게 항상 human_confirm으로
+    귀결된다 - 자동 확정 경로는 없다. confidence가 재검색 구간(RETRY_CONFIDENCE_FLOOR
+    ~ HIGH_CONFIDENCE_SKIP_RETRY)에 있고 재검색 여지가 남아 있을 때만, 담당자에게
+    보여주기 전에 검색 범위를 넓혀 후보 품질을 한 번 더 개선해본다."""
     conf = judgment["confidence"]
-    if conf >= AUTO_CONFIRM_CONFIDENCE:
-        return "auto_confirm"
-    if conf < RETRY_CONFIDENCE_FLOOR:
-        return "human_confirm"
-    if retrieval_attempts < MAX_RETRIEVAL_ATTEMPTS:
+    if RETRY_CONFIDENCE_FLOOR <= conf < HIGH_CONFIDENCE_SKIP_RETRY and retrieval_attempts < MAX_RETRIEVAL_ATTEMPTS:
         return "retry"
-    return "human_confirm"  # 재검색 소진 시 폴백
+    return "human_confirm"
 
 
 # ── Tool: expand_retrieval_params ──────────────────────────
@@ -396,29 +439,10 @@ def update_meta_tag(con, column_id: str, tag: str, confidence: float = None):
         )
 
 
-# ── Tool: log_auto_confirm (신규, 자동 확정 전량 감사 기록) ─
-def _ensure_auto_confirm_log_table(con):
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS auto_confirm_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            column_id VARCHAR,
-            eng_name VARCHAR,
-            confidence DOUBLE,
-            evidence TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-
-def log_auto_confirm(column_id: str, eng_name: str, confidence: float, evidence: str):
-    con = sqlite3.connect(AUDIT_DB_PATH)
-    _ensure_auto_confirm_log_table(con)
-    con.execute(
-        "INSERT INTO auto_confirm_log (column_id, eng_name, confidence, evidence) VALUES (?, ?, ?, ?)",
-        [column_id, eng_name, confidence, evidence],
-    )
-    con.commit()
-    con.close()
+# auto_confirm_log 테이블(자동 확정 전량 감사 기록)은 추정 매칭이 confidence 무관 항상
+# 담당자 확인을 거치도록 바뀌면서 더 이상 새로 기록되지 않는다. 과거에 자동 확정됐던
+# 기록은 "실측 없이 정한 임계값(0.92)이 실제로 안전했는지" 사후 점검용 역사적 데이터로
+# 남겨두되(schemascout_audit.sqlite), 신규 적재 함수는 제거한다.
 
 
 # ── Tool: log_confirmation_to_audit ────────────────────────
@@ -460,6 +484,85 @@ def _enrich_relationships(con, result: dict) -> dict:
     return result
 
 
+# ── Tool: persist_confirmed_mapping_example (Episodic Memory 적재) ──
+def _ensure_confirmed_mapping_tables(con):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS confirmed_mapping_examples (
+            example_id VARCHAR PRIMARY KEY,
+            eng_name VARCHAR,
+            kor_name VARCHAR,
+            description VARCHAR,
+            column_id VARCHAR,
+            confirmation_source VARCHAR,
+            confirmed_at TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS confirmed_mapping_embeddings (
+            example_id VARCHAR,
+            embedding FLOAT[3072]
+        )
+    """)
+
+
+# resolution_path == "validated"로 확정된 match_status만 대상 - auto_confirmed는 사람이 검증한 적이
+# 없어(LLM 자기 확신만으로 통과) 제외한다. 이 캐시에 auto_confirmed를 넣으면, confidence 임계값
+# 자체가 틀렸을 경우 그 오류가 캐시를 통해 스스로 재생산·증폭되는 위험이 있다.
+CONFIRMED_MAPPING_SOURCE_BY_STATUS = {
+    "matched": "exact_match",           # 정확 매칭(단일 매칭 또는 담당자가 테이블을 선택한 경우 포함)
+    "inferred_confirmed": "human_confirmed",  # 담당자가 실제로 승인
+}
+
+
+def persist_confirmed_mapping_example(con, row: dict, embed_fn) -> None:
+    """검증된 매핑만 Episodic Memory(confirmed_mapping_*)로 누적한다.
+    row["resolution_path"] == "validated"인 경우만 대상이며, 이는 exact_match_meta_db 정확 매칭이나
+    담당자가 직접 승인한 inferred_confirmed에서만 설정된다(auto_confirmed는 해당 없음).
+    동일 (영문명, column_id) 조합이 이미 있으면 재적재하지 않는다(멱등).
+    """
+    if row.get("resolution_path") != "validated":
+        return
+    meta_row = row.get("meta_row")
+    if not meta_row:
+        return
+    confirmation_source = CONFIRMED_MAPPING_SOURCE_BY_STATUS.get(row.get("match_status"))
+    if confirmation_source is None:
+        return
+
+    eng_name = str(row.get("영문명") or "").strip()
+    column_id = meta_row.get("column_id")
+    if not eng_name or not column_id:
+        return
+
+    _ensure_confirmed_mapping_tables(con)
+    example_id = f"cme__{column_id}__{eng_name}"
+    exists = con.execute(
+        "SELECT 1 FROM confirmed_mapping_examples WHERE example_id = ?", [example_id]
+    ).fetchone()
+    if exists:
+        return
+
+    kor_name = str(row.get("한글명") or "").strip()
+    description = str(row.get("항목설명") or "").strip()
+    embed_text = description or f"{eng_name} {kor_name}".strip()
+    if not embed_text:
+        return
+
+    with tool_span("persist_confirmed_mapping_example"):
+        resp = embed_fn("DEPLOYMENT_EMBED_LARGE", embed_text)
+        vec = resp.data[0].embedding
+    con.execute(
+        "INSERT INTO confirmed_mapping_examples "
+        "(example_id, eng_name, kor_name, description, column_id, confirmation_source) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [example_id, eng_name, kor_name, description, column_id, confirmation_source],
+    )
+    con.execute(
+        "INSERT INTO confirmed_mapping_embeddings (example_id, embedding) VALUES (?, ?)",
+        [example_id, vec],
+    )
+
+
 # ── Tool: 병렬 프리페치 워커 (담당자 확인이 필요 없는 순수 조회/API 호출만) ──
 def _exact_match_with_own_connection(row: dict) -> tuple:
     """단일 행에 대해 자기만의 DuckDB 커넥션으로 정확 매칭 조회 - 병렬 워커용.
@@ -498,7 +601,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
     """
     parsed_rows: parsing_agent.run_parsing(...)의 state['parsed_rows']
     반환: 각 행에 match_status, resolution_path, table_relationships 등이 추가된 결과 리스트
-    (matched / auto_confirmed / inferred_confirmed 만 다음 단계로 넘어갈 대상, unresolved는 여기서 종결)
+    (matched / inferred_confirmed 만 다음 단계로 넘어갈 대상, unresolved는 여기서 종결)
 
     Parallelization: 행마다 서로 독립적이지만, 애매한 경우(동일 컬럼명 중복, 확신도
     애매)는 담당자 확인(interrupt() 가능성)을 거쳐야 해서 무분별하게 병렬화하면 여러
@@ -539,6 +642,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
         if exact["found"]:
             out = {**row, "match_status": "matched", "meta_row": exact["meta_row"],
                    "match_evidence": "영문명 정확 매칭", "resolution_path": "validated"}
+            persist_confirmed_mapping_example(con, out, embed_fn)
             results.append(_enrich_relationships(con, out))
             continue
 
@@ -552,6 +656,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                        "match_evidence": f"영문명 정확 매칭 - 동일 컬럼명이 {len(table_ids)}개 테이블"
                                           f"({', '.join(table_ids)})에 존재해 담당자가 {selected['table_id']} 선택",
                        "resolution_path": "validated"}
+                persist_confirmed_mapping_example(con, out, embed_fn)
                 results.append(_enrich_relationships(con, out))
             else:
                 out = {**row, "match_status": "unresolved", "meta_row": None,
@@ -582,7 +687,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
             if not candidates:
                 out = {**row, "match_status": "unresolved", "meta_row": None,
                        "match_evidence": "검색된 후보 없음", "unresolved_reason": "no_match",
-                       "resolution_path": "no_match"}
+                       "resolution_path": "no_match", "retrieval_attempts": attempts}
                 results.append(out)
                 resolved = True
                 break
@@ -591,17 +696,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                 judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn)
             route = decide_route(judgment, attempts)
 
-            if route == "auto_confirm":
-                selected = next(c for c in candidates if c["column_id"] == judgment["selected_column_id"])
-                update_meta_tag(con, selected["column_id"], "auto_confirmed", confidence=judgment["confidence"])
-                log_auto_confirm(selected["column_id"], eng_name, judgment["confidence"], judgment["evidence"])
-                out = {**row, "match_status": "auto_confirmed", "meta_row": selected["meta_row"],
-                       "match_evidence": judgment["evidence"], "llm_confidence": judgment["confidence"],
-                       "llm_evidence": judgment["evidence"], "resolution_path": "auto_confirmed"}
-                results.append(_enrich_relationships(con, out))
-                resolved = True
-
-            elif route == "retry":
+            if route == "retry":
                 attempts += 1
                 params = expand_retrieval_params(attempts)
                 top_k, floor, glossary_boost = params["top_k"], params["floor"], params["include_glossary_boost"]
@@ -622,14 +717,16 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                     update_meta_tag(con, selected["column_id"], "inferred_confirmed", confidence=judgment["confidence"])
                     out = {**row, "match_status": "inferred_confirmed", "meta_row": selected["meta_row"],
                            "match_evidence": judgment["evidence"], "llm_confidence": judgment["confidence"],
-                           "llm_evidence": judgment["evidence"], "resolution_path": "validated"}
+                           "llm_evidence": judgment["evidence"], "resolution_path": "validated",
+                           "retrieval_attempts": attempts}
+                    persist_confirmed_mapping_example(con, out, embed_fn)
                     results.append(_enrich_relationships(con, out))
                 else:
                     if target_column_id:
                         update_meta_tag(con, target_column_id, "unresolved", confidence=judgment["confidence"])
                     out = {**row, "match_status": "unresolved", "meta_row": None,
                            "match_evidence": "담당자 확인 결과 거절", "unresolved_reason": "rejected_by_human",
-                           "resolution_path": "rejected_by_human"}
+                           "resolution_path": "rejected_by_human", "retrieval_attempts": attempts}
                     results.append(out)
                 resolved = True
 

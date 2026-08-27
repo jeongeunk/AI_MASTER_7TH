@@ -3,10 +3,9 @@ Report Agent
 
 역할: 전체 파이프라인 결과를 취합하여 최종 제공 가능 명세서(엑셀)로 재구성.
 - 경로 A(정상 검증): Meta Search(matched/inferred_confirmed) -> DB Validation -> Classification
-- 경로 D(LLM 자동 확정): Meta Search(retrieve_node -> judge_node, confidence>=0.92)
-  -> 경로 A와 동일하게 DB Validation -> Classification까지 계속 진행
+  (추정 매칭은 confidence 크기와 무관하게 항상 담당자 확인을 거친 뒤에만 이 경로로 들어온다 -
+   자동 확정 경로는 없다)
 - 경로 B(담당자 거절/미매칭): Meta Search에서 unresolved로 조기 종결 (DB Validation/Classification 미경유)
-경로 A와 D는 최종 태그 6종 체계는 동일하며 resolution_path 컬럼으로만 구분한다.
 """
 
 import os
@@ -26,7 +25,6 @@ AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
 RESOLUTION_PATH_LABEL = {
     "validated": "정상 검증",
-    "auto_confirmed": "AI 자동 확정",
     "rejected_by_human": "담당자 거절",
     "no_match": "매칭 후보 없음",
     "join_key_added": "조인을 위해 자동 추가",
@@ -46,17 +44,15 @@ TAG_LABEL = {
 def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFrame:
     rows = []
 
-    # 경로 A/D: 정상 검증 (Classification까지 완료) — auto_confirmed 여부는 resolution_path로 구분
+    # 경로 A: 정상 검증 (Classification까지 완료) — join_key_added 여부는 resolution_path로 구분
     for r in classified_results:
         resolution_path = (
             r.get("resolution_path")
-            if r.get("resolution_path") in ("auto_confirmed", "join_key_added")
+            if r.get("resolution_path") == "join_key_added"
             else "validated"
         )
         evidence = r.get("evidence")
-        if resolution_path == "auto_confirmed" and r.get("llm_evidence"):
-            evidence = f"[AI 자동 확정] {r.get('llm_evidence')} | {evidence}"
-        elif resolution_path == "join_key_added" and r.get("match_evidence"):
+        if resolution_path == "join_key_added" and r.get("match_evidence"):
             evidence = f"[조인키 자동 추가] {r.get('match_evidence')} | {evidence}"
 
         rows.append({
@@ -71,6 +67,7 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
             "최종태그": r.get("final_tag"),
             "근거": evidence,
             "resolution_path": resolution_path,
+            "재검색 횟수": r.get("retrieval_attempts"),
         })
 
     # 경로 B/C: Meta Search에서 조기 종결 (unresolved - 거절 또는 미매칭)
@@ -89,6 +86,7 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
             "최종태그": "unresolved",
             "근거": r.get("match_evidence"),
             "resolution_path": r.get("unresolved_reason", "no_match"),
+            "재검색 횟수": r.get("retrieval_attempts"),
         })
 
     return pd.DataFrame(rows)
@@ -176,7 +174,7 @@ def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_
             "요청 type", "제공가능 type",
             "요청시점(기간)", "제공가능시점(기간)",
             "항목설명", "소속테이블",
-            "최종태그", "태그설명", "처리경로", "근거",
+            "최종태그", "태그설명", "처리경로", "재검색 횟수", "근거",
         ]
         df = df[ordered_cols]
 
@@ -209,7 +207,6 @@ def compute_summary_stats(merged_df: pd.DataFrame) -> dict:
         "total": len(merged_df),
         "tag_counts": tag_counts,
         "resolution_path_counts": path_counts,
-        "auto_confirm_count": path_counts.get("auto_confirmed", 0),
     }
 
 

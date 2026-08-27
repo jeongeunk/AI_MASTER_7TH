@@ -3,8 +3,9 @@ run_threshold_sweep.py (RAG 전환 반영판)
 
 B1 비교표를 실측치로 채우기 위한 스크립트. 평가셋(evaluation/eval_set.csv)에 대해
 1) exact match / fuzzy match / vss 유사도 검색의 커버율을 각각 측정하고
-2) LLM 판단(generate_match_judgment)까지 포함한 auto_confirm/retry/human_confirm 분포와
+2) LLM 판단(generate_match_judgment)까지 포함한 retry/human_confirm 분포와
    컬럼당 평균 처리시간을 측정해 evaluation/matching_comparison.csv 로 저장한다.
+   (추정 매칭은 confidence 무관 항상 담당자 확인을 거치므로 auto_confirm 버킷은 없다)
 
 평가셋 형식 (evaluation/eval_set.csv):
     영문명, 한글명, 항목설명, expected_tag
@@ -73,8 +74,10 @@ def measure_exact_and_fuzzy(con, eval_rows: list) -> dict:
 
 
 def measure_rag_judgment(con, eval_rows: list) -> dict:
-    """exact match 실패 건에 한해 retrieve_candidates + generate_match_judgment 실측"""
-    counts = {"auto_confirm": 0, "retry": 0, "human_confirm": 0, "no_candidates": 0}
+    """exact match 실패 건에 한해 retrieve_candidates + generate_match_judgment 실측.
+    추정 매칭은 confidence 무관 항상 담당자 확인을 거치므로(자동 확정 경로 없음),
+    route는 retry/human_confirm 둘 중 하나다."""
+    counts = {"retry": 0, "human_confirm": 0, "no_candidates": 0}
     elapsed_total = 0.0
     evaluated = 0
 
@@ -99,7 +102,6 @@ def measure_rag_judgment(con, eval_rows: list) -> dict:
 
     return {
         "rag_evaluated_count": evaluated,
-        "rag_auto_confirm": counts["auto_confirm"],
         "rag_retry": counts["retry"],
         "rag_human_confirm": counts["human_confirm"],
         "rag_no_candidates": counts["no_candidates"],

@@ -8,9 +8,9 @@ Meta Search Agent의 매칭 분기(ambiguous / LLM judgment / no_match)를 테�
   exact_match_meta_db가 ambiguous로 반환 -> table_disambiguation_confirmation HITL
 - total_recharge_amt: 실제 컬럼(raw_telecom_fact_recharge_voice.total_rech_amt)과
   이름은 다르지만 뜻은 같음 -> exact match 실패, retrieve_candidates가 후보를 찾고
-  generate_match_judgment(gpt-5-mini, Structured Output)이 판단 -> confidence에 따라
-  auto_confirm 또는 human_confirm으로 라우팅됨(실행마다 LLM 응답이 달라질 수 있어
-  100% 고정은 아니지만 0.85~0.95대에서 형성되는 걸 실측 확인함)
+  generate_match_judgment(gpt-5-mini, Structured Output)이 판단 -> confidence와 무관하게
+  항상 human_confirm으로 라우팅됨(추정 매칭은 자동 확정 경로가 없음). confidence가
+  높으면(HIGH_CONFIDENCE_SKIP_RETRY=0.92 이상) 재검색 없이, 그 사이면 재검색 후 담당자 확인으로 감
 - satellite_uptime_ratio: 통신 도메인과 무관한 컬럼명 -> retrieve_candidates가 후보를
   0개 반환하는 것을 실측 확인함 -> unresolved(no_match)로 즉시 종결
 """

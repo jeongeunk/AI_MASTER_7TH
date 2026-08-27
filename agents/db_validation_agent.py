@@ -1,7 +1,7 @@
 """
 DB Validation Agent
 
-역할: matched + auto_confirmed + inferred_confirmed 컬럼에 한해 실데이터 DB에 접속해
+역할: matched + inferred_confirmed 컬럼에 한해 실데이터 DB에 접속해
       존재 여부·실제 type·보유 기간 조회. type 불일치 시 담당자 확인 후 최종 type 확정.
 
 Guardrail:
@@ -256,13 +256,13 @@ def execute_readonly_query(con, validated_query: str, timeout_sec: int = QUERY_T
 def run_db_validation(meta_search_results: list, confirm_fn=None) -> list:
     """
     meta_search_results: meta_search_agent.run_meta_search(...) 결과
-    matched / auto_confirmed / inferred_confirmed 인 행만 실제 검증 수행, 그 외는 그대로 통과(존재여부 없이 skip)
+    matched / inferred_confirmed 인 행만 실제 검증 수행, 그 외는 그대로 통과(존재여부 없이 skip)
     """
     con = get_guarded_connection()
     results = []
 
     for row in meta_search_results:
-        if row["match_status"] not in ("matched", "auto_confirmed", "inferred_confirmed"):
+        if row["match_status"] not in ("matched", "inferred_confirmed"):
             # unresolved는 Meta Search Agent에서 이미 종결되어 여기 안 옴 (안전장치)
             continue
 

@@ -52,13 +52,13 @@ for r in meta3:
 
 expected3 = {
     "mobile_number": "matched",       # ambiguous -> 담당자가 선택 -> matched
-    "total_recharge_amt": None,       # auto_confirmed 또는 inferred_confirmed(human_confirm 경유) 둘 다 정상
+    "total_recharge_amt": None,       # 항상 human_confirm 경유 -> inferred_confirmed(승인) 또는 unresolved(거절)
     "satellite_uptime_ratio": "unresolved",
 }
 log("\n  [검증]")
 by_name = {r["영문명"]: r for r in meta3}
 log(f"    mobile_number ambiguous->matched: {by_name['mobile_number']['match_status'] == 'matched'}")
-log(f"    total_recharge_amt LLM 경로 탐: {by_name['total_recharge_amt']['match_status'] in ('auto_confirmed', 'inferred_confirmed')} "
+log(f"    total_recharge_amt LLM 경로(담당자 확인) 탐: {by_name['total_recharge_amt']['match_status'] == 'inferred_confirmed'} "
     f"(실제: {by_name['total_recharge_amt']['match_status']})")
 log(f"    satellite_uptime_ratio no_match: {by_name['satellite_uptime_ratio']['match_status'] == 'unresolved'}")
 
