@@ -74,34 +74,40 @@ def _load_relationship_edges(con) -> list:
 
 
 # ── Tool: find_join_path (기존 관계 그래프 탐색, 최대 2-hop) ──
-def find_join_path(edges: list, table_a: str, table_b: str, max_hops: int = 2):
+def find_join_path(edges: list, table_a: str, table_b: str, max_hops: int = 2, context: str = None):
     """table_relationships 그래프에서 table_a -> table_b 경로를 BFS로 찾는다.
     직접 연결이 없어도 공통 테이블(보통 dim 테이블)을 경유하는 경로를 찾을 수 있다.
     반환: hop 리스트(각 {from,to,join_key,relation_type,source,confidence}) 또는 못 찾으면 None."""
-    if table_a == table_b:
-        return []
+    with tool_span("find_join_path", context=context) as span:
+        span.set_args({"table_a": table_a, "table_b": table_b})
 
-    adjacency = {}
-    for e in edges:
-        adjacency.setdefault(e["from"], []).append(e)
-        adjacency.setdefault(e["to"], []).append({**e, "from": e["to"], "to": e["from"]})
+        if table_a == table_b:
+            span.set_result([])
+            return []
 
-    queue = deque([(table_a, [])])
-    visited = {table_a}
-    while queue:
-        node, path = queue.popleft()
-        if len(path) >= max_hops:
-            continue
-        for edge in adjacency.get(node, []):
-            nxt = edge["to"]
-            if nxt in visited:
+        adjacency = {}
+        for e in edges:
+            adjacency.setdefault(e["from"], []).append(e)
+            adjacency.setdefault(e["to"], []).append({**e, "from": e["to"], "to": e["from"]})
+
+        queue = deque([(table_a, [])])
+        visited = {table_a}
+        while queue:
+            node, path = queue.popleft()
+            if len(path) >= max_hops:
                 continue
-            new_path = path + [edge]
-            if nxt == table_b:
-                return new_path
-            visited.add(nxt)
-            queue.append((nxt, new_path))
-    return None
+            for edge in adjacency.get(node, []):
+                nxt = edge["to"]
+                if nxt in visited:
+                    continue
+                new_path = path + [edge]
+                if nxt == table_b:
+                    span.set_result(f"경로 발견({len(new_path)} hop)")
+                    return new_path
+                visited.add(nxt)
+                queue.append((nxt, new_path))
+        span.set_result("경로 없음")
+        return None
 
 
 # ── Tool: find_shared_identifier_columns (규칙 기반 후보) ───
@@ -262,7 +268,7 @@ def _console_join_confirm(payload: dict) -> str:
     return "approved" if ans == "y" else "rejected"
 
 
-def request_join_key_confirmation(table_a: str, table_b: str, candidate: dict, confirm_fn=None) -> str:
+def request_join_key_confirmation(table_a: str, table_b: str, candidate: dict, confirm_fn=None, context: str = None) -> str:
     """confirm_fn: payload(dict) -> "approved" | "rejected". None이면 콘솔 input().
     메타 매칭과 달리 조인키는 confidence가 아무리 높아도 자동 확정 경로를 두지 않는다 -
     한 번 잘못 확정되면 table_relationships에 저장돼 이후 모든 명세서에 영향을 준다."""
@@ -277,7 +283,11 @@ def request_join_key_confirmation(table_a: str, table_b: str, candidate: dict, c
         "evidence": _describe_candidate(candidate),
     }
     fn = confirm_fn or _console_join_confirm
-    return fn(payload)
+    with tool_span("request_join_key_confirmation (HITL)", context=context) as span:
+        span.set_args(payload)
+        decision = fn(payload)
+        span.set_result(decision)
+    return decision
 
 
 # ── Tool: persist_confirmed_relationship ───────────────────
@@ -306,44 +316,49 @@ def _split_join_key(join_key: str) -> list:
     return [c.strip() for c in str(join_key).split(",") if c.strip()]
 
 
-def validate_join_path(con, path: list) -> dict:
+def validate_join_path(con, path: list, context: str = None) -> dict:
     """조인 경로에 관련된 모든 테이블에 대해, 조인키 컬럼(들)의 type이 일치하는지와
     각 테이블의 보유기간을 조회하고, 그 교집합(=조인된 결과가 실제로 유효한 기간)을
     구한다. db_validation_agent의 query_column_type/query_retention_period를 그대로
     재사용 - 조인키도 결국 일반 컬럼과 똑같이 검증해야 한다."""
-    tables_involved = sorted({t for hop in path for t in (hop["from"], hop["to"])})
-    key_parts = sorted({part for hop in path for part in _split_join_key(hop["join_key"])})
+    with tool_span("validate_join_path", context=context) as span:
+        tables_involved = sorted({t for hop in path for t in (hop["from"], hop["to"])})
+        key_parts = sorted({part for hop in path for part in _split_join_key(hop["join_key"])})
+        span.set_args({"tables_involved": tables_involved, "key_parts": key_parts})
 
-    key_types = {}
-    types_by_col = {}
-    for table in tables_involved:
-        for col in key_parts:
-            t = query_column_type(con, table, col)
-            key_types[f"{table}.{col}"] = t
-            types_by_col.setdefault(col, set()).add(t)
-    type_consistent = all(len(s) <= 1 for s in types_by_col.values())
+        key_types = {}
+        types_by_col = {}
+        for table in tables_involved:
+            for col in key_parts:
+                t = query_column_type(con, table, col)
+                key_types[f"{table}.{col}"] = t
+                types_by_col.setdefault(col, set()).add(t)
+        type_consistent = all(len(s) <= 1 for s in types_by_col.values())
 
-    period_by_table = {}
-    for table in tables_involved:
-        rp = query_retention_period(con, table, "")
-        period_by_table[table] = (rp["start"], rp["end"])
+        period_by_table = {}
+        for table in tables_involved:
+            rp = query_retention_period(con, table, "", context=context)
+            period_by_table[table] = (rp["start"], rp["end"])
 
-    joined_period = intersect_periods(list(period_by_table.values()))
+        joined_period = intersect_periods(list(period_by_table.values()), context=context)
 
-    return {
-        "tables_involved": tables_involved,
-        "key_types": key_types,
-        "type_consistent": type_consistent,
-        "period_by_table": period_by_table,
-        "joined_period": joined_period,
-    }
+        result = {
+            "tables_involved": tables_involved,
+            "key_types": key_types,
+            "type_consistent": type_consistent,
+            "period_by_table": period_by_table,
+            "joined_period": joined_period,
+        }
+        span.set_result({"type_consistent": type_consistent, "joined_period": joined_period})
+    return result
 
 
 # ── Tool: resolve_join_for_pair (테이블 쌍 하나 처리) ───────
 def resolve_join_for_pair(con, table_a: str, table_b: str, edges: list, confirm_fn=None) -> dict:
-    path = find_join_path(edges, table_a, table_b)
+    pair_context = f"{table_a}<->{table_b}"
+    path = find_join_path(edges, table_a, table_b, context=pair_context)
     if path:
-        validation = validate_join_path(con, path)
+        validation = validate_join_path(con, path, context=pair_context)
         join_key_desc = " -> ".join(f"{h['from']}.{h['join_key']}={h['to']}.{h['join_key']}" for h in path)
         return {
             "table_a": table_a, "table_b": table_b, "status": "resolved", "source": "declared",
@@ -362,7 +377,7 @@ def resolve_join_for_pair(con, table_a: str, table_b: str, edges: list, confirm_
                 "source": None, "evidence": reason}
 
     best = viable[0]
-    decision = request_join_key_confirmation(table_a, table_b, best, confirm_fn=confirm_fn)
+    decision = request_join_key_confirmation(table_a, table_b, best, confirm_fn=confirm_fn, context=pair_context)
     if decision != "approved":
         return {
             "table_a": table_a, "table_b": table_b, "status": "join_key_missing",
@@ -380,7 +395,7 @@ def resolve_join_for_pair(con, table_a: str, table_b: str, edges: list, confirm_
     hop = {"from": table_a, "to": table_b, "join_key": join_key,
            "relation_type": best["overlap_stats"]["relation_type"],
            "source": "inferred_confirmed", "confidence": best["confidence"]}
-    validation = validate_join_path(con, [hop])
+    validation = validate_join_path(con, [hop], context=pair_context)
     return {
         "table_a": table_a, "table_b": table_b, "status": "resolved", "source": "inferred_confirmed",
         "path": [hop], "join_key": join_key, "confidence": best["confidence"],
@@ -399,28 +414,31 @@ def find_missing_join_key_columns(join_results: list, meta_results: list) -> lis
     (컬럼명이 테이블 간에 같으면 같은 키로 취급하는 지금 설계와 일관되게, 어느
     테이블에서 요청했는지는 안 가리고 이름만으로 대조한다.)
     """
-    requested_columns = {
-        r["meta_row"]["column_name"] for r in meta_results
-        if r.get("match_status") in ("matched", "inferred_confirmed") and r.get("meta_row")
-    }
+    with tool_span("find_missing_join_key_columns") as span:
+        requested_columns = {
+            r["meta_row"]["column_name"] for r in meta_results
+            if r.get("match_status") in ("matched", "inferred_confirmed") and r.get("meta_row")
+        }
 
-    missing = {}  # key_column -> {"tables": set, "needed_for": set of (table_a, table_b)}
-    for r in join_results:
-        if r.get("status") != "resolved":
-            continue
-        for hop in r.get("path", []):
-            for part in _split_join_key(hop["join_key"]):
-                if part in requested_columns:
-                    continue
-                entry = missing.setdefault(part, {"tables": set(), "needed_for": set()})
-                entry["tables"].add(hop["from"])
-                entry["tables"].add(hop["to"])
-                entry["needed_for"].add((r["table_a"], r["table_b"]))
+        missing = {}  # key_column -> {"tables": set, "needed_for": set of (table_a, table_b)}
+        for r in join_results:
+            if r.get("status") != "resolved":
+                continue
+            for hop in r.get("path", []):
+                for part in _split_join_key(hop["join_key"]):
+                    if part in requested_columns:
+                        continue
+                    entry = missing.setdefault(part, {"tables": set(), "needed_for": set()})
+                    entry["tables"].add(hop["from"])
+                    entry["tables"].add(hop["to"])
+                    entry["needed_for"].add((r["table_a"], r["table_b"]))
 
-    return [
-        {"key_column": col, "tables": sorted(info["tables"]), "needed_for": sorted(info["needed_for"])}
-        for col, info in missing.items()
-    ]
+        result = [
+            {"key_column": col, "tables": sorted(info["tables"]), "needed_for": sorted(info["needed_for"])}
+            for col, info in missing.items()
+        ]
+        span.set_result(f"누락 키 {len(result)}건: {[r['key_column'] for r in result]}")
+    return result
 
 
 # ── Tool: request_missing_key_confirmation (담당자 확인) ───
@@ -450,7 +468,11 @@ def request_missing_key_confirmation(missing_key: dict, confirm_fn=None) -> str:
         ),
     }
     fn = confirm_fn or _console_missing_key_confirm
-    return fn(payload)
+    with tool_span("request_missing_key_confirmation (HITL)", context=missing_key.get("key_column")) as span:
+        span.set_args(payload)
+        decision = fn(payload)
+        span.set_result(decision)
+    return decision
 
 
 # ── Tool: build_added_key_row (승인된 키를 요청 컬럼으로 합성) ─

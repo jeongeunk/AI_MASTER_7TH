@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import duckdb
 from dotenv import load_dotenv
+from agents.trace import tool_span
 from agents.meta_search_agent import update_meta_tag  # 공유 도구 재사용
 
 load_dotenv()
@@ -23,23 +24,27 @@ META_DB_PATH = os.environ.get("META_DB_PATH", "./db/schemascout_meta.duckdb")
 
 
 # ── Tool: classify_existence ────────────────────────────────
-def classify_existence(exists: bool) -> dict:
-    if not exists:
-        return {"tag": "not_found"}
-    return {"tag": None}
+def classify_existence(exists: bool, context: str = None) -> dict:
+    with tool_span("classify_existence", context=context) as span:
+        span.set_args({"exists": exists})
+        result = {"tag": "not_found"} if not exists else {"tag": None}
+        span.set_result(result)
+    return result
 
 
 # ── Tool: tag_from_type_status ──────────────────────────────
-def tag_from_type_status(type_match_status: str) -> dict:
+def tag_from_type_status(type_match_status: str, context: str = None) -> dict:
     """
     DB Validation Agent가 전달한 결과를 그대로 반영, 재비교 없음.
     - mismatch_confirmed(담당자가 DB 기준으로 갱신 승인) -> type 문제 해소된 것으로 보고 기간 비교로 진행
     - mismatch_rejected(담당자가 갱신 거절, 명세 type 유지) -> type_mismatch로 확정, 기간 비교 없이 종료
     - matched -> 기간 비교로 진행
     """
-    if type_match_status == "mismatch_rejected":
-        return {"tag": "type_mismatch"}
-    return {"tag": None}
+    with tool_span("tag_from_type_status", context=context) as span:
+        span.set_args({"type_match_status": type_match_status})
+        result = {"tag": "type_mismatch"} if type_match_status == "mismatch_rejected" else {"tag": None}
+        span.set_result(result)
+    return result
 
 
 # ── Tool: compare_period ────────────────────────────────────
@@ -51,7 +56,7 @@ def _parse_period(period_str: str):
     return int(parts[0]), int(parts[1])
 
 
-def intersect_periods(periods: list) -> tuple:
+def intersect_periods(periods: list, context: str = None) -> tuple:
     """
     N개 (start, end) 기간의 교집합을 구한다. periods 중 하나라도 None을 포함하면
     (기간 정보 없음) 교집합도 구할 수 없으므로 None 반환. 겹치는 구간이 없어도 None.
@@ -59,45 +64,56 @@ def intersect_periods(periods: list) -> tuple:
     결과가 실제로 유효한 기간)을 구할 때 재사용한다 - compare_period의 2개짜리
     overlap 계산을 N개로 일반화한 것.
     """
-    starts, ends = [], []
-    for p in periods:
-        if not p or p[0] is None or p[1] is None:
-            return None
-        starts.append(p[0])
-        ends.append(p[1])
-    if not starts:
-        return None
-    overlap_start, overlap_end = max(starts), min(ends)
-    if overlap_start > overlap_end:
-        return None
-    return (overlap_start, overlap_end)
+    with tool_span("intersect_periods", context=context) as span:
+        span.set_args({"periods": periods})
+        starts, ends = [], []
+        result = None
+        for p in periods:
+            if not p or p[0] is None or p[1] is None:
+                span.set_result(None)
+                return None
+            starts.append(p[0])
+            ends.append(p[1])
+        if starts:
+            overlap_start, overlap_end = max(starts), min(ends)
+            if overlap_start <= overlap_end:
+                result = (overlap_start, overlap_end)
+        span.set_result(result)
+    return result
 
 
-def compare_period(requested: tuple, retained: tuple) -> dict:
-    req_start, req_end = requested
-    ret_start, ret_end = retained
+def compare_period(requested: tuple, retained: tuple, context: str = None) -> dict:
+    with tool_span("compare_period", context=context) as span:
+        span.set_args({"requested": requested, "retained": retained})
+        req_start, req_end = requested
+        ret_start, ret_end = retained
 
-    if ret_start is None or ret_end is None:
-        return {"tag": "period_mismatch", "final_period": None,
-                "evidence": "보유기간 정보 없음"}
+        if ret_start is None or ret_end is None:
+            result = {"tag": "period_mismatch", "final_period": None,
+                      "evidence": "보유기간 정보 없음"}
+            span.set_result(result)
+            return result
 
-    # 요청 기간 미기재 -> 현재 보유 중인 전체 기간을 참고로 제공
-    if req_start is None or req_end is None:
-        return {"tag": "full_period", "final_period": (ret_start, ret_end),
-                "evidence": f"요청기간 미기재 - 현재 보유 중인 전체 기간({ret_start}~{ret_end})을 참고로 제공"}
+        # 요청 기간 미기재 -> 현재 보유 중인 전체 기간을 참고로 제공
+        if req_start is None or req_end is None:
+            result = {"tag": "full_period", "final_period": (ret_start, ret_end),
+                      "evidence": f"요청기간 미기재 - 현재 보유 중인 전체 기간({ret_start}~{ret_end})을 참고로 제공"}
+            span.set_result(result)
+            return result
 
-    overlap = intersect_periods([(req_start, req_end), (ret_start, ret_end)])
+        overlap = intersect_periods([(req_start, req_end), (ret_start, ret_end)], context=context)
 
-    if overlap is None:
-        return {"tag": "period_mismatch", "final_period": None,
-                "evidence": f"요청기간({req_start}~{req_end})과 보유기간({ret_start}~{ret_end}) 겹치는 구간 없음"}
-
-    if req_start >= ret_start and req_end <= ret_end:
-        return {"tag": "full_period", "final_period": (req_start, req_end),
-                "evidence": f"요청기간 전체가 보유기간({ret_start}~{ret_end})에 포함됨"}
-
-    return {"tag": "confirm_period", "final_period": overlap,
-            "evidence": f"요청기간 일부만 보유 -> 제공가능 기간({overlap[0]}~{overlap[1]})으로 조정"}
+        if overlap is None:
+            result = {"tag": "period_mismatch", "final_period": None,
+                      "evidence": f"요청기간({req_start}~{req_end})과 보유기간({ret_start}~{ret_end}) 겹치는 구간 없음"}
+        elif req_start >= ret_start and req_end <= ret_end:
+            result = {"tag": "full_period", "final_period": (req_start, req_end),
+                      "evidence": f"요청기간 전체가 보유기간({ret_start}~{ret_end})에 포함됨"}
+        else:
+            result = {"tag": "confirm_period", "final_period": overlap,
+                      "evidence": f"요청기간 일부만 보유 -> 제공가능 기간({overlap[0]}~{overlap[1]})으로 조정"}
+        span.set_result(result)
+    return result
 
 
 # ── 오케스트레이션 ───────────────────────────────────────────
@@ -111,26 +127,27 @@ def run_classification(validation_results: list) -> list:
     for row in validation_results:
         out = dict(row)
         column_id = row["meta_row"]["column_id"] if row.get("meta_row") else None
+        row_context = str(row.get("영문명") or column_id or "")
 
         # Step 1: 존재 여부
-        existence = classify_existence(row["exists"])
+        existence = classify_existence(row["exists"], context=row_context)
         if existence["tag"] == "not_found":
             out["final_tag"] = "not_found"
             out["evidence"] = "메타에는 있었으나 실 DB에서 컬럼 확인 불가"
             out["final_period"] = None
             if column_id:
-                update_meta_tag(con, column_id, "not_found", confidence=1.0)
+                update_meta_tag(con, column_id, "not_found", confidence=1.0, context=row_context)
             results.append(out)
             continue
 
         # Step 2: type 결과 반영 (재비교 없음) - mismatch_rejected만 여기서 종료
-        type_tag = tag_from_type_status(row.get("type_match_status"))
+        type_tag = tag_from_type_status(row.get("type_match_status"), context=row_context)
         if type_tag["tag"] == "type_mismatch":
             out["final_tag"] = "type_mismatch"
             out["evidence"] = "명세 type과 실제 type 불일치 - 담당자 확인(거절)으로 명세 type 유지, 최종 확정"
             out["final_period"] = None
             if column_id:
-                update_meta_tag(con, column_id, "type_mismatch", confidence=1.0)
+                update_meta_tag(con, column_id, "type_mismatch", confidence=1.0, context=row_context)
             results.append(out)
             continue
 
@@ -139,7 +156,7 @@ def run_classification(validation_results: list) -> list:
         retention = row.get("retention_period") or {}
         retained = (retention.get("start"), retention.get("end"))
 
-        period_result = compare_period(requested, retained)
+        period_result = compare_period(requested, retained, context=row_context)
         out["final_tag"] = period_result["tag"]
         out["final_period"] = period_result["final_period"]
         out["retention_estimated"] = bool(retention.get("estimated"))
@@ -160,7 +177,7 @@ def run_classification(validation_results: list) -> list:
         out["source_table"] = row.get("source_table")
 
         if column_id:
-            update_meta_tag(con, column_id, period_result["tag"], confidence=1.0)
+            update_meta_tag(con, column_id, period_result["tag"], confidence=1.0, context=row_context)
 
         results.append(out)
 

@@ -103,23 +103,26 @@ def select_header_row_with_llm(candidates: list) -> tuple:
     candidates 목록 밖의 행 번호를 응답하지 못하도록 프롬프트로 제약(hallucination 방지).
     반환: (선택된 row_idx 또는 None, evidence)
     """
-    if not candidates:
-        return None, "후보 행이 전혀 없음"
+    with tool_span("select_header_row_with_llm", model="gpt-4.1-mini" if candidates else None) as span:
+        span.set_args({"candidates": candidates})
 
-    from llm_client import chat_parsed
+        if not candidates:
+            span.set_result((None, "후보 행이 전혀 없음"))
+            return None, "후보 행이 전혀 없음"
 
-    candidate_lines = "\n".join(
-        f"- row_idx={c['row_idx']}: {c['preview']}" for c in candidates
-    )
-    system_prompt = (
-        "너는 데이터 명세서 파일에서 실제 컬럼 헤더가 있는 행을 찾는 보조자다.\n"
-        "아래 \"후보 행 목록\"만 근거로 판단한다. 목록에 없는 row_idx를 임의로 만들어내지 않는다.\n"
-        "후보 행 목록은 표준 필드(영문명/한글명/항목설명/type/시점) 키워드가 일부 포함된 행들이며,\n"
-        "이 중 설명/요약 문구가 아니라 실제 표의 컬럼 헤더 역할을 하는 행 하나를 고른다."
-    )
-    user_prompt = f"후보 행 목록:\n{candidate_lines}"
+        from llm_client import chat_parsed
 
-    with tool_span("select_header_row_with_llm", model="gpt-4.1-mini"):
+        candidate_lines = "\n".join(
+            f"- row_idx={c['row_idx']}: {c['preview']}" for c in candidates
+        )
+        system_prompt = (
+            "너는 데이터 명세서 파일에서 실제 컬럼 헤더가 있는 행을 찾는 보조자다.\n"
+            "아래 \"후보 행 목록\"만 근거로 판단한다. 목록에 없는 row_idx를 임의로 만들어내지 않는다.\n"
+            "후보 행 목록은 표준 필드(영문명/한글명/항목설명/type/시점) 키워드가 일부 포함된 행들이며,\n"
+            "이 중 설명/요약 문구가 아니라 실제 표의 컬럼 헤더 역할을 하는 행 하나를 고른다."
+        )
+        user_prompt = f"후보 행 목록:\n{candidate_lines}"
+
         response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
@@ -129,16 +132,19 @@ def select_header_row_with_llm(candidates: list) -> tuple:
             temperature=0.2,
             response_format=HeaderRowJudgment,
         )
-    message = response.choices[0].message
-    judgment = getattr(message, "parsed", None)
-    if judgment is None:
-        reason = getattr(message, "refusal", None) or "Structured Output 응답 없음"
-        return None, reason
+        message = response.choices[0].message
+        judgment = getattr(message, "parsed", None)
+        if judgment is None:
+            reason = getattr(message, "refusal", None) or "Structured Output 응답 없음"
+            span.set_result((None, reason))
+            return None, reason
 
-    valid_indices = {c["row_idx"] for c in candidates}
-    if judgment.header_row_idx in valid_indices:
-        return judgment.header_row_idx, judgment.evidence
-    return None, judgment.evidence
+        valid_indices = {c["row_idx"] for c in candidates}
+        if judgment.header_row_idx in valid_indices:
+            span.set_result((judgment.header_row_idx, judgment.evidence))
+            return judgment.header_row_idx, judgment.evidence
+        span.set_result((None, judgment.evidence))
+        return None, judgment.evidence
 
 
 # ── 담당자 확인 (헤더 "행" 판별 실패 시) ─────────────────────
@@ -171,21 +177,30 @@ def request_header_row_confirmation(raw: pd.DataFrame, attempts: list, confirm_f
         "row_previews": row_previews,
     }
     fn = confirm_fn or _console_header_row_confirm
-    raw_decision = fn(payload)
-    if isinstance(raw_decision, dict):
-        return {"decision": raw_decision.get("decision"), "selected_row_idx": raw_decision.get("selected_row_idx")}
-    # confirm_fn이 단순 문자열만 반환하는 경우 - 근거(선택된 행)가 없으므로 거절 처리
-    return {"decision": "rejected", "selected_row_idx": None}
+    with tool_span("request_header_row_confirmation (HITL)") as span:
+        span.set_args(payload)
+        raw_decision = fn(payload)
+        if isinstance(raw_decision, dict):
+            result = {"decision": raw_decision.get("decision"), "selected_row_idx": raw_decision.get("selected_row_idx")}
+        else:
+            # confirm_fn이 단순 문자열만 반환하는 경우 - 근거(선택된 행)가 없으므로 거절 처리
+            result = {"decision": "rejected", "selected_row_idx": None}
+        span.set_result(result)
+        return result
 
 
 def parse_excel_to_df(file_path: str, confirm_fn=None) -> pd.DataFrame:
     """엑셀 파일을 DataFrame으로 로드, 헤더 자동 탐지(행 위치 제한 없이 시트 전체 스캔)"""
-    with tool_span("read_excel"):
+    with tool_span("read_excel") as span:
+        span.set_args({"file_path": file_path})
         raw = pd.read_excel(file_path, header=None)
+        span.set_result(f"{len(raw)}행 로드")
 
     # 1차: 확실한 기준(hits>=3)으로 후보 수집
-    with tool_span("rule_scan_header_row"):
+    with tool_span("rule_scan_header_row") as span:
+        span.set_args({"min_hits": 3})
         strong_candidates = _find_header_row_candidates(raw, min_hits=3)
+        span.set_result(f"후보 {len(strong_candidates)}개: {[c['row_idx'] for c in strong_candidates]}")
 
     if len(strong_candidates) == 1:
         # 후보가 정확히 1개면 규칙만으로 확정 (LLM 호출 없음)
@@ -219,7 +234,8 @@ def parse_excel_to_df(file_path: str, confirm_fn=None) -> pd.DataFrame:
 # ── Tool 2: map_columns_by_header (규칙 기반, 기존 유지) ───
 def map_columns_by_header(df: pd.DataFrame, header_row: int = 0) -> dict:
     """실제 헤더명을 표준 필드로 매핑 -> {표준필드: 원본컬럼명} (키워드 포함 매칭)"""
-    with tool_span("map_columns_by_header"):
+    with tool_span("map_columns_by_header") as span:
+        span.set_args({"headers": [str(c) for c in df.columns]})
         mapping = {}
         for col in df.columns:
             col_str = str(col).strip().lower()
@@ -229,6 +245,7 @@ def map_columns_by_header(df: pd.DataFrame, header_row: int = 0) -> dict:
                 if any(kw.lower() in col_str for kw in keywords):
                     mapping[std_field] = col
                     break
+        span.set_result(mapping)
         return mapping
 
 
@@ -284,7 +301,8 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
         f"아직 매핑되지 않은 원본 헤더 목록(헤더명 + 샘플값): {json.dumps(header_samples, ensure_ascii=False)}"
     )
 
-    with tool_span("generate_header_mapping_judgment", model="gpt-4.1-mini"):
+    with tool_span("generate_header_mapping_judgment", model="gpt-4.1-mini") as span:
+        span.set_args({"missing_std_fields": missing_std_fields, "header_samples": header_samples})
         response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
@@ -294,11 +312,14 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
             temperature=0.2,
             response_format=HeaderMappingJudgment,
         )
-    message = response.choices[0].message
-    judgment = getattr(message, "parsed", None)
-    if judgment is None:
-        return []
-    return [m.model_dump() for m in judgment.mappings]
+        message = response.choices[0].message
+        judgment = getattr(message, "parsed", None)
+        if judgment is None:
+            span.set_result([])
+            return []
+        result = [m.model_dump() for m in judgment.mappings]
+        span.set_result(result)
+        return result
 
 
 # ── JSON 안전 변환 (pandas 결측치 NaN -> None) ─────────────
@@ -346,9 +367,12 @@ def _load_data_catalog():
 
 def map_candidate_tables(column_name: str) -> list:
     """컬럼명을 실데이터 DB 카탈로그(information_schema.columns) 기준 후보 테이블과 매핑"""
-    with tool_span("map_candidate_tables"):
+    with tool_span("map_candidate_tables") as span:
+        span.set_args({"column_name": column_name})
         catalog = _load_data_catalog()
-        return catalog.get(column_name, [])
+        result = catalog.get(column_name, [])
+        span.set_result(result)
+        return result
 
 
 # ── Tool 4.5: find_row_completion (부분 정보 행 보완) ──────
@@ -375,9 +399,10 @@ class NameFieldInferenceResult(BaseModel):
     fields: List[NameFieldInference]
 
 
-def infer_name_fields_with_llm(present_fields: dict, missing_fields: list) -> dict:
+def infer_name_fields_with_llm(present_fields: dict, missing_fields: list, context: str = None) -> dict:
     """메타DB에 후보가 없을 때, LLM 자체 지식으로 누락된 영문명/한글명/항목설명을 추론(참고용).
     반환: {필드명: {"value": 추론값 또는 None, "confidence": float, "evidence": str}}
+    context: 로그에서 "몇 번째 행 처리 중인지" 구분하기 위한 태그(예: "행2: avg_data_amt")
     """
     from llm_client import chat_parsed  # 지연 임포트 (단독 테스트 시 llm_client 없이도 규칙 매칭만 쓸 수 있게)
 
@@ -388,7 +413,8 @@ def infer_name_fields_with_llm(present_fields: dict, missing_fields: list) -> di
     )
     user_prompt = f"알려진 정보: {present_fields}\n요청 필드: {missing_fields}"
 
-    with tool_span("infer_name_fields_with_llm", model="gpt-4.1-mini"):
+    with tool_span("infer_name_fields_with_llm", model="gpt-4.1-mini", context=context) as span:
+        span.set_args({"present_fields": present_fields, "missing_fields": missing_fields})
         response = chat_parsed(
             "DEPLOYMENT_GPT41_MINI",
             [
@@ -398,26 +424,29 @@ def infer_name_fields_with_llm(present_fields: dict, missing_fields: list) -> di
             temperature=0.2,
             response_format=NameFieldInferenceResult,
         )
-    message = response.choices[0].message
-    judgment = getattr(message, "parsed", None)
+        message = response.choices[0].message
+        judgment = getattr(message, "parsed", None)
 
-    result = {f: {"value": None, "confidence": 0.0, "evidence": ""} for f in missing_fields}
-    if judgment is None:
+        result = {f: {"value": None, "confidence": 0.0, "evidence": ""} for f in missing_fields}
+        if judgment is None:
+            span.set_result(result)
+            return result
+        for entry in judgment.fields:
+            if entry.field in result:
+                result[entry.field] = {
+                    "value": entry.value,
+                    "confidence": max(0.0, min(1.0, entry.confidence)),
+                    "evidence": entry.evidence,
+                }
+        span.set_result(result)
         return result
-    for entry in judgment.fields:
-        if entry.field in result:
-            result[entry.field] = {
-                "value": entry.value,
-                "confidence": max(0.0, min(1.0, entry.confidence)),
-                "evidence": entry.evidence,
-            }
-    return result
 
 
-def find_row_completion(row: dict, meta_con) -> dict:
+def find_row_completion(row: dict, meta_con, context: str = None) -> dict:
     """영문명/한글명/항목설명 중 일부만 있는 행에 대해, 메타DB 매칭을 우선 시도하고
     후보가 없으면 LLM 자체 지식으로 나머지를 추정한다(둘 다 담당자 확인 대상).
     반환: {missing_fields, proposed_fill, source, confidence, evidence} 또는 채울 근거가 전혀 없으면 None
+    context: 로그에서 "몇 번째 행을 처리 중인지" 구분하기 위한 태그(선택)
     """
     present = {
         f: row[f] for f in NAME_FIELDS
@@ -433,7 +462,7 @@ def find_row_completion(row: dict, meta_con) -> dict:
     candidate_meta_row, match_confidence, match_evidence = None, 0.0, ""
 
     if eng_name:
-        exact = exact_match_meta_db(meta_con, eng_name)
+        exact = exact_match_meta_db(meta_con, eng_name, context=context)
         if exact["found"]:
             candidate_meta_row = exact["meta_row"]
             match_confidence, match_evidence = 1.0, "영문명 정확 매칭"
@@ -443,6 +472,7 @@ def find_row_completion(row: dict, meta_con) -> dict:
         candidates = retrieve_candidates(
             meta_con, eng_name, query_text, embed, top_k=1,
             floor=SIMILARITY_PREFILTER_FLOOR, include_glossary_boost=True,
+            context=context,
         )
         if candidates:
             candidate_meta_row = candidates[0]["meta_row"]
@@ -458,7 +488,7 @@ def find_row_completion(row: dict, meta_con) -> dict:
                     "confidence": round(float(match_confidence), 4), "evidence": match_evidence}
 
     # 메타DB 후보 없음 -> LLM 자체 지식으로 추론
-    llm_result = infer_name_fields_with_llm(present, missing)
+    llm_result = infer_name_fields_with_llm(present, missing, context=context)
     proposed = {f: v["value"] for f, v in llm_result.items() if v.get("value")}
     if not proposed:
         return None
@@ -493,12 +523,17 @@ def request_row_completion_confirmation(pending_completions: list, confirm_fn=No
     """
     payload = {"type": "row_completion_confirmation", "candidates": pending_completions}
     fn = confirm_fn or _console_row_completion_confirm
-    raw = fn(payload)
-    if isinstance(raw, dict):
-        return {"decision": raw.get("decision"), "approved_row_indices": raw.get("approved_row_indices") or []}
-    if raw == "approved":
-        return {"decision": "approved", "approved_row_indices": [c["row_index"] for c in pending_completions]}
-    return {"decision": "rejected", "approved_row_indices": []}
+    with tool_span("request_row_completion_confirmation (HITL)") as span:
+        span.set_args(payload)
+        raw = fn(payload)
+        if isinstance(raw, dict):
+            result = {"decision": raw.get("decision"), "approved_row_indices": raw.get("approved_row_indices") or []}
+        elif raw == "approved":
+            result = {"decision": "approved", "approved_row_indices": [c["row_index"] for c in pending_completions]}
+        else:
+            result = {"decision": "rejected", "approved_row_indices": []}
+        span.set_result(result)
+        return result
 
 
 # ── 담당자 확인 (헤더 매핑 실패 시) ─────────────────────────
@@ -627,7 +662,10 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
     unresolved_fields = []
     for std_field in list(missing_std_fields):
         payload = _build_header_confirmation_payload(std_field, header_mapping, df, llm_results)
-        decision = fn(payload)
+        with tool_span(f"header_field_confirmation (HITL: {std_field})") as span:
+            span.set_args(payload)
+            decision = fn(payload)
+            span.set_result(decision)
 
         if decision.get("decision") == "approved" and decision.get("selected_column"):
             header_mapping[std_field] = decision["selected_column"]
@@ -699,7 +737,8 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
                     meta_con.execute("LOAD vss;")
                 except duckdb.Error:
                     pass
-            completion = find_row_completion(row, meta_con)
+            row_context = f"행{idx}: {row.get('영문명') or '(영문명 없음)'}"
+            completion = find_row_completion(row, meta_con, context=row_context)
             if completion:
                 pending_completions.append({"row_index": idx, **completion})
                 continue

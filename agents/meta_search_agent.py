@@ -53,7 +53,7 @@ MAX_RETRIEVAL_ATTEMPTS = 2          # 재검색 최대 횟수
 
 
 # ── Tool: exact_match_meta_db ──────────────────────────────
-def exact_match_meta_db(con, eng_name: str) -> dict:
+def exact_match_meta_db(con, eng_name: str, context: str = None) -> dict:
     """
     영문명이 여러 테이블에 동일하게 존재할 수 있다(예: mobile_number는 이 데이터셋의
     6개 테이블 전부에 있음). 예전에는 fetchone()으로 그중 하나를 임의로(DB 내부
@@ -61,22 +61,27 @@ def exact_match_meta_db(con, eng_name: str) -> dict:
     202506까지, 나머지는 202512까지) 어느 테이블이 뽑히느냐에 따라
     "제공가능시점(기간)" 자체가 달라진다 - 그래서 후보가 2개 이상이면 단일 확정하지
     않고 ambiguous로 반환해 담당자 확인으로 넘긴다.
+    context: 로그에서 "무엇을 찾다가 호출됐는지" 구분하기 위한 태그(선택)
     """
-    with tool_span("exact_match_meta_db"):
+    with tool_span("exact_match_meta_db", context=context) as span:
+        span.set_args({"eng_name": eng_name})
         rows = con.execute(
             "SELECT column_id, table_id, column_name, data_type, description "
             "FROM column_spec WHERE column_name = ?",
             [eng_name],
         ).fetchall()
-    candidates = [
-        {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
-        for r in rows
-    ]
-    if len(candidates) == 1:
-        return {"found": True, "ambiguous": False, "meta_row": candidates[0], "candidates": candidates}
-    if len(candidates) > 1:
-        return {"found": False, "ambiguous": True, "meta_row": None, "candidates": candidates}
-    return {"found": False, "ambiguous": False, "meta_row": None, "candidates": []}
+        candidates = [
+            {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
+            for r in rows
+        ]
+        if len(candidates) == 1:
+            result = {"found": True, "ambiguous": False, "meta_row": candidates[0], "candidates": candidates}
+        elif len(candidates) > 1:
+            result = {"found": False, "ambiguous": True, "meta_row": None, "candidates": candidates}
+        else:
+            result = {"found": False, "ambiguous": False, "meta_row": None, "candidates": []}
+        span.set_result({"found": result["found"], "ambiguous": result["ambiguous"], "candidate_count": len(candidates)})
+        return result
 
 
 # ── Tool: fuzzy_match_candidates ───────────────────────────
@@ -109,15 +114,18 @@ def fuzzy_match_candidates(eng_name: str, candidate_pool: list, top_k: int = 5) 
 # ── Tool: retrieve_candidates (semantic_search_meta 대체) ──
 def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                          top_k: int = 5, floor: float = SIMILARITY_PREFILTER_FLOOR,
-                         include_glossary_boost: bool = False) -> list:
+                         include_glossary_boost: bool = False, context: str = None) -> list:
     """
     column_embeddings(vss) + glossary_embeddings(vss, linked_column_id 있는 것만) +
     confirmed_mapping_embeddings(vss, Episodic Memory) + 문자열 유사도(fuzzy)를
     병합해 후보 top_k를 반환한다.
     각 후보: {column_id, source: 'vss_column'|'vss_glossary'|'confirmed_mapping'|'fuzzy', score, meta_row}
+    context: 로그에서 "무엇을 찾다가 호출됐는지" 구분하기 위한 태그(선택)
     """
-    with tool_span("embed (retrieve_candidates)", model="text-embedding-3-large"):
+    with tool_span("embed (retrieve_candidates)", model="text-embedding-3-large", context=context) as span:
+        span.set_args({"description": description})
         resp = embed_fn("DEPLOYMENT_EMBED_LARGE", description)
+        span.set_result(f"{len(resp.data[0].embedding)}차원 벡터 생성 완료")
     query_vec = resp.data[0].embedding
 
     merged = {}  # column_id -> candidate dict (가장 점수 높은 것 유지)
@@ -130,7 +138,8 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
             merged[column_id] = {"column_id": column_id, "source": source, "score": round(score, 4), "meta_row": meta_row}
 
     # 1) 컬럼 설명 임베딩 유사도
-    with tool_span("vss_search (column_embeddings)"):
+    with tool_span("vss_search (column_embeddings)", context=context) as span:
+        span.set_args({"top_k": top_k})
         col_rows = con.execute(
             """
             SELECT cs.column_id, cs.table_id, cs.column_name, cs.data_type, cs.description,
@@ -142,6 +151,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
             """,
             [query_vec, max(top_k * 2, 5)],
         ).fetchall()
+        span.set_result(f"후보 {len(col_rows)}건")
     for r in col_rows:
         similarity = 1 - r[5]
         meta_row = {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
@@ -150,7 +160,8 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     # 2) 도메인 용어집(glossary) 임베딩 유사도 — linked_column_id가 있는 것만 후보로 승격
     glossary_floor = (floor - 0.15) if include_glossary_boost else floor
     try:
-        with tool_span("vss_search (glossary_embeddings)"):
+        with tool_span("vss_search (glossary_embeddings)", context=context) as span:
+            span.set_args({"top_k": top_k})
             gloss_rows = con.execute(
                 """
                 SELECT gt.linked_column_id, gt.canonical_term,
@@ -163,6 +174,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                 """,
                 [query_vec, max(top_k * 2, 5)],
             ).fetchall()
+            span.set_result(f"후보 {len(gloss_rows)}건")
         for r in gloss_rows:
             similarity = 1 - r[2]
             if similarity < glossary_floor:
@@ -183,7 +195,8 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     #    auto_confirmed는 사람이 검증한 적이 없어 여기 포함되지 않는다(persist_confirmed_mapping_example 참고).
     #    사람이 이미 검증한 사례라 컬럼 설명 임베딩과 동일한 floor로 취급한다(glossary처럼 낮춰주지 않음).
     try:
-        with tool_span("vss_search (confirmed_mapping_embeddings)"):
+        with tool_span("vss_search (confirmed_mapping_embeddings)", context=context) as span:
+            span.set_args({"top_k": top_k})
             conf_rows = con.execute(
                 """
                 SELECT cme.column_id,
@@ -195,6 +208,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                 """,
                 [query_vec, max(top_k * 2, 5)],
             ).fetchall()
+            span.set_result(f"후보 {len(conf_rows)}건")
         for r in conf_rows:
             similarity = 1 - r[1]
             if similarity < floor:
@@ -212,9 +226,11 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
         pass
 
     # 4) 문자열 유사도 (오탈자·표기 변형)
-    with tool_span("fuzzy_match_candidates"):
+    with tool_span("fuzzy_match_candidates", context=context) as span:
+        span.set_args({"eng_name": eng_name})
         all_columns = _fetch_all_columns(con)
         fuzzy_results = fuzzy_match_candidates(eng_name, all_columns, top_k=top_k)
+        span.set_result(f"후보 {len(fuzzy_results)}건")
     for fm in fuzzy_results:
         cid = fm["column_id"]
         if cid in merged:
@@ -326,24 +342,33 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
 
 
 # ── Tool: decide_route (route_by_judgment의 순수함수 버전) ─
-def decide_route(judgment: dict, retrieval_attempts: int) -> str:
+def decide_route(judgment: dict, retrieval_attempts: int, context: str = None) -> str:
     """추정 매칭(정확 매칭이 아닌 경우)은 confidence와 무관하게 항상 human_confirm으로
     귀결된다 - 자동 확정 경로는 없다. confidence가 재검색 구간(RETRY_CONFIDENCE_FLOOR
     ~ HIGH_CONFIDENCE_SKIP_RETRY)에 있고 재검색 여지가 남아 있을 때만, 담당자에게
     보여주기 전에 검색 범위를 넓혀 후보 품질을 한 번 더 개선해본다."""
-    conf = judgment["confidence"]
-    if RETRY_CONFIDENCE_FLOOR <= conf < HIGH_CONFIDENCE_SKIP_RETRY and retrieval_attempts < MAX_RETRIEVAL_ATTEMPTS:
-        return "retry"
-    return "human_confirm"
+    with tool_span("decide_route", context=context) as span:
+        span.set_args({"confidence": judgment["confidence"], "retrieval_attempts": retrieval_attempts})
+        conf = judgment["confidence"]
+        if RETRY_CONFIDENCE_FLOOR <= conf < HIGH_CONFIDENCE_SKIP_RETRY and retrieval_attempts < MAX_RETRIEVAL_ATTEMPTS:
+            route = "retry"
+        else:
+            route = "human_confirm"
+        span.set_result(route)
+    return route
 
 
 # ── Tool: expand_retrieval_params ──────────────────────────
-def expand_retrieval_params(attempt_no: int) -> dict:
-    return {
-        "top_k": 5 + attempt_no * 3,
-        "floor": max(0.55, SIMILARITY_PREFILTER_FLOOR - attempt_no * 0.10),
-        "include_glossary_boost": True,
-    }
+def expand_retrieval_params(attempt_no: int, context: str = None) -> dict:
+    with tool_span("expand_retrieval_params", context=context) as span:
+        span.set_args({"attempt_no": attempt_no})
+        params = {
+            "top_k": 5 + attempt_no * 3,
+            "floor": max(0.55, SIMILARITY_PREFILTER_FLOOR - attempt_no * 0.10),
+            "include_glossary_boost": True,
+        }
+        span.set_result(params)
+    return params
 
 
 # ── Tool: request_inferred_confirmation (담당자 확인) ──────
@@ -362,7 +387,7 @@ def _console_confirm(payload: dict) -> str:
 
 
 def request_inferred_confirmation(column_meta: dict, candidates: list, judgment: dict,
-                                   confirm_fn=None) -> str:
+                                   confirm_fn=None, context: str = None) -> str:
     payload = {
         "type": "inferred_confirmation",
         "eng_name": column_meta.get("영문명"),
@@ -377,14 +402,23 @@ def request_inferred_confirmation(column_meta: dict, candidates: list, judgment:
         ],
     }
     fn = confirm_fn or _console_confirm
-    return fn(payload)
+    with tool_span("request_inferred_confirmation (HITL)", context=context) as span:
+        span.set_args(payload)
+        decision = fn(payload)
+        span.set_result(decision)
+    return decision
 
 
 # ── Tool: apply_confirmation_result ────────────────────────
-def apply_confirmation_result(decision: str) -> dict:
-    if decision == "approved":
-        return {"final_tag": "inferred_confirmed", "confirmation_status": "approved"}
-    return {"final_tag": "unresolved", "confirmation_status": "rejected"}
+def apply_confirmation_result(decision: str, context: str = None) -> dict:
+    with tool_span("apply_confirmation_result", context=context) as span:
+        span.set_args({"decision": decision})
+        if decision == "approved":
+            result = {"final_tag": "inferred_confirmed", "confirmation_status": "approved"}
+        else:
+            result = {"final_tag": "unresolved", "confirmation_status": "rejected"}
+        span.set_result(result)
+    return result
 
 
 # ── Tool: request_table_disambiguation (담당자 확인) ───────
@@ -402,7 +436,7 @@ def _console_table_disambiguation_confirm(payload: dict) -> dict:
     return {"decision": "approved", "selected_table_id": payload["candidates"][idx]["table_id"]}
 
 
-def request_table_disambiguation(column_meta: dict, candidates: list, confirm_fn=None) -> dict:
+def request_table_disambiguation(column_meta: dict, candidates: list, confirm_fn=None, context: str = None) -> dict:
     """
     영문명이 여러 테이블에 동일하게 존재해 단일 확정이 불가능할 때, 어느 테이블
     소속 컬럼을 쓸지 담당자에게 직접 고르게 한다. 자동으로 하나를 골라버리지 않는
@@ -423,20 +457,27 @@ def request_table_disambiguation(column_meta: dict, candidates: list, confirm_fn
         ],
     }
     fn = confirm_fn or _console_table_disambiguation_confirm
-    raw = fn(payload)
-    if isinstance(raw, dict):
-        return {"decision": raw.get("decision"), "selected_table_id": raw.get("selected_table_id")}
-    # confirm_fn이 단순 문자열만 반환하는 경우 - 어느 테이블인지 근거가 없으므로 거절 처리
-    return {"decision": "rejected", "selected_table_id": None}
+    with tool_span("request_table_disambiguation (HITL)", context=context) as span:
+        span.set_args(payload)
+        raw = fn(payload)
+        if isinstance(raw, dict):
+            result = {"decision": raw.get("decision"), "selected_table_id": raw.get("selected_table_id")}
+        else:
+            # confirm_fn이 단순 문자열만 반환하는 경우 - 어느 테이블인지 근거가 없으므로 거절 처리
+            result = {"decision": "rejected", "selected_table_id": None}
+        span.set_result(result)
+    return result
 
 
 # ── Tool: update_meta_tag (Classification Agent와 공유) ────
-def update_meta_tag(con, column_id: str, tag: str, confidence: float = None):
-    with tool_span("update_meta_tag"):
+def update_meta_tag(con, column_id: str, tag: str, confidence: float = None, context: str = None):
+    with tool_span("update_meta_tag", context=context) as span:
+        span.set_args({"column_id": column_id, "tag": tag, "confidence": confidence})
         con.execute(
             "UPDATE column_spec SET tag = ?, confidence = ?, updated_at = current_timestamp WHERE column_id = ?",
             [tag, confidence, column_id],
         )
+        span.set_result("column_spec 갱신 완료")
 
 
 # auto_confirm_log 테이블(자동 확정 전량 감사 기록)은 추정 매칭이 confidence 무관 항상
@@ -446,20 +487,25 @@ def update_meta_tag(con, column_id: str, tag: str, confidence: float = None):
 
 
 # ── Tool: log_confirmation_to_audit ────────────────────────
-def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_no: int = 1):
-    con = sqlite3.connect(AUDIT_DB_PATH)
-    exists = con.execute(
-        "SELECT 1 FROM qna_history WHERE column_id = ? AND question = ? AND answer = ? LIMIT 1",
-        [column_id, question, answer],
-    ).fetchone()
-    if not exists:
-        con.execute(
-            "INSERT INTO qna_history (column_id, interaction_type, question, answer, round_no) "
-            "VALUES (?, 'confirmation', ?, ?, ?)",
-            [column_id, question, answer, round_no],
-        )
-        con.commit()
-    con.close()
+def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_no: int = 1, context: str = None):
+    with tool_span("log_confirmation_to_audit", context=context) as span:
+        span.set_args({"column_id": column_id, "question": question, "answer": answer})
+        con = sqlite3.connect(AUDIT_DB_PATH)
+        exists = con.execute(
+            "SELECT 1 FROM qna_history WHERE column_id = ? AND question = ? AND answer = ? LIMIT 1",
+            [column_id, question, answer],
+        ).fetchone()
+        if not exists:
+            con.execute(
+                "INSERT INTO qna_history (column_id, interaction_type, question, answer, round_no) "
+                "VALUES (?, 'confirmation', ?, ?, ?)",
+                [column_id, question, answer, round_no],
+            )
+            con.commit()
+            span.set_result("qna_history에 신규 기록됨")
+        else:
+            span.set_result("이미 기록되어 있어 중복 삽입 안 함")
+        con.close()
 
 
 # ── Tool: get_table_relationships ──────────────────────────
@@ -638,6 +684,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
     results = []
     for i, row in enumerate(parsed_rows):
         eng_name, exact = exact_by_index[i]
+        row_context = f"{eng_name or '(영문명 없음)'}"
 
         if exact["found"]:
             out = {**row, "match_status": "matched", "meta_row": exact["meta_row"],
@@ -648,7 +695,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
 
         if exact.get("ambiguous"):
             candidates_by_table = exact["candidates"]
-            decision = request_table_disambiguation(row, candidates_by_table, confirm_fn=confirm_fn)
+            decision = request_table_disambiguation(row, candidates_by_table, confirm_fn=confirm_fn, context=row_context)
             table_ids = [c["table_id"] for c in candidates_by_table]
             if decision.get("decision") == "approved" and decision.get("selected_table_id"):
                 selected = next(c for c in candidates_by_table if c["table_id"] == decision["selected_table_id"])
@@ -694,23 +741,24 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
 
             if judgment is None:
                 judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn)
-            route = decide_route(judgment, attempts)
+            route = decide_route(judgment, attempts, context=row_context)
 
             if route == "retry":
                 attempts += 1
-                params = expand_retrieval_params(attempts)
+                params = expand_retrieval_params(attempts, context=row_context)
                 top_k, floor, glossary_boost = params["top_k"], params["floor"], params["include_glossary_boost"]
                 # 루프 계속 (재검색)
 
             else:  # human_confirm
-                decision = request_inferred_confirmation(row, candidates, judgment, confirm_fn)
-                confirm_result = apply_confirmation_result(decision)
+                decision = request_inferred_confirmation(row, candidates, judgment, confirm_fn, context=row_context)
+                confirm_result = apply_confirmation_result(decision, context=row_context)
                 target_column_id = judgment.get("selected_column_id") or (candidates[0]["column_id"] if candidates else None)
                 if target_column_id:
                     log_confirmation_to_audit(
                         target_column_id,
                         question=f"{eng_name} -> LLM 추천(확신도 {judgment['confidence']}) 승인?",
                         answer=decision,
+                        context=row_context,
                     )
                 if decision == "approved" and target_column_id:
                     selected = next((c for c in candidates if c["column_id"] == target_column_id), candidates[0])

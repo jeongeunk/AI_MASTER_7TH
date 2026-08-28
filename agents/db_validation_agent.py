@@ -56,36 +56,52 @@ def get_guarded_connection():
     LangGraph interrupt() 재개 시 노드 함수가 처음부터 재실행되므로,
     이미 ATTACH되어 있으면 다시 시도하지 않도록 방어.
     """
-    con = duckdb.connect(META_DB_PATH)
-    attached = [row[0] for row in con.execute(
-        "SELECT database_name FROM duckdb_databases()"
-    ).fetchall()]
-    if "data_db" not in attached:
-        con.execute(f"ATTACH '{DATA_DB_PATH}' AS data_db (READ_ONLY)")
+    with tool_span("get_guarded_connection") as span:
+        con = duckdb.connect(META_DB_PATH)
+        attached = [row[0] for row in con.execute(
+            "SELECT database_name FROM duckdb_databases()"
+        ).fetchall()]
+        if "data_db" not in attached:
+            con.execute(f"ATTACH '{DATA_DB_PATH}' AS data_db (READ_ONLY)")
+            span.set_result("data_db ATTACH 완료 (READ_ONLY)")
+        else:
+            span.set_result("이미 ATTACH되어 있어 재시도 안 함")
     return con
 
 
 def validate_query_structure(raw_query: str) -> dict:
     """쿼리가 단일 SELECT 문인지, DDL/DML을 포함하는지 AST 기반 검증"""
-    try:
-        parsed = sqlglot.parse(raw_query, read="duckdb")
-    except Exception as e:
-        return {"is_valid": False, "violation_type": f"parse_error: {e}"}
+    with tool_span("validate_query_structure") as span:
+        span.set_args({"raw_query": raw_query})
+        try:
+            parsed = sqlglot.parse(raw_query, read="duckdb")
+        except Exception as e:
+            result = {"is_valid": False, "violation_type": f"parse_error: {e}"}
+            span.set_result(result)
+            return result
 
-    if len(parsed) != 1:
-        return {"is_valid": False, "violation_type": "multiple_statements"}
+        if len(parsed) != 1:
+            result = {"is_valid": False, "violation_type": "multiple_statements"}
+            span.set_result(result)
+            return result
 
-    stmt = parsed[0]
-    stmt_type = type(stmt).__name__
-    if stmt_type != "Select":
-        return {"is_valid": False, "violation_type": f"not_select ({stmt_type})"}
+        stmt = parsed[0]
+        stmt_type = type(stmt).__name__
+        if stmt_type != "Select":
+            result = {"is_valid": False, "violation_type": f"not_select ({stmt_type})"}
+            span.set_result(result)
+            return result
 
-    forbidden = ("Insert", "Update", "Delete", "Drop", "Create", "Alter", "Merge")
-    for node in stmt.walk():
-        if type(node[0]).__name__ in forbidden:
-            return {"is_valid": False, "violation_type": f"forbidden_clause ({type(node[0]).__name__})"}
+        forbidden = ("Insert", "Update", "Delete", "Drop", "Create", "Alter", "Merge")
+        for node in stmt.walk():
+            if type(node[0]).__name__ in forbidden:
+                result = {"is_valid": False, "violation_type": f"forbidden_clause ({type(node[0]).__name__})"}
+                span.set_result(result)
+                return result
 
-    return {"is_valid": True, "violation_type": None}
+        result = {"is_valid": True, "violation_type": None}
+        span.set_result(result)
+    return result
 
 
 # ── Tool: check_column_exists ──────────────────────────────
@@ -120,8 +136,12 @@ def query_column_type(con, table: str, column: str) -> str:
 
 
 # ── Tool: compare_type_immediate ───────────────────────────
-def compare_type_immediate(spec_type: str, actual_type: str) -> bool:
-    return str(spec_type).upper() == str(actual_type).upper()
+def compare_type_immediate(spec_type: str, actual_type: str, context: str = None) -> bool:
+    with tool_span("compare_type_immediate", context=context) as span:
+        span.set_args({"spec_type": spec_type, "actual_type": actual_type})
+        match = str(spec_type).upper() == str(actual_type).upper()
+        span.set_result(match)
+    return match
 
 
 # ── Tool: request_type_confirmation (담당자 확인) ───────────
@@ -138,7 +158,7 @@ def _console_confirm(payload: dict) -> str:
 
 
 def request_type_confirmation(spec_type: str, actual_type: str, column_id: str, table: str,
-                               confirm_fn=None) -> str:
+                               confirm_fn=None, context: str = None) -> str:
     """
     confirm_fn: payload(dict) -> "approved" | "rejected" 를 반환하는 콜백.
     None이면 콘솔 input()으로 동작(단독 실행용). LangGraph 노드에서는
@@ -152,7 +172,11 @@ def request_type_confirmation(spec_type: str, actual_type: str, column_id: str, 
         "actual_type": actual_type,
     }
     fn = confirm_fn or _console_confirm
-    return fn(payload)
+    with tool_span("request_type_confirmation (HITL)", context=context) as span:
+        span.set_args(payload)
+        decision = fn(payload)
+        span.set_result(decision)
+    return decision
 
 
 # ── Tool: apply_type_confirmation ──────────────────────────
@@ -163,59 +187,67 @@ def apply_type_confirmation(decision: str, spec_type: str, actual_type: str) -> 
 
 
 # ── Tool: log_confirmation_to_audit ────────────────────────
-def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_no: int = 1):
+def log_confirmation_to_audit(column_id: str, question: str, answer: str, round_no: int = 1, context: str = None):
     """
     LangGraph interrupt() 재개 시 노드가 재실행되며 이미 처리된 확인도 다시 지나가므로,
     동일한 (column_id, question, answer) 조합이 이미 기록되어 있으면 중복 삽입하지 않음.
     """
-    con = sqlite3.connect(AUDIT_DB_PATH)
-    exists = con.execute(
-        "SELECT 1 FROM qna_history WHERE column_id = ? AND question = ? AND answer = ? LIMIT 1",
-        [column_id, question, answer],
-    ).fetchone()
-    if not exists:
-        con.execute(
-            "INSERT INTO qna_history (column_id, interaction_type, question, answer, round_no) "
-            "VALUES (?, 'confirmation', ?, ?, ?)",
-            [column_id, question, answer, round_no],
-        )
-        con.commit()
-    con.close()
+    with tool_span("log_confirmation_to_audit", context=context) as span:
+        span.set_args({"column_id": column_id, "question": question, "answer": answer})
+        con = sqlite3.connect(AUDIT_DB_PATH)
+        exists = con.execute(
+            "SELECT 1 FROM qna_history WHERE column_id = ? AND question = ? AND answer = ? LIMIT 1",
+            [column_id, question, answer],
+        ).fetchone()
+        if not exists:
+            con.execute(
+                "INSERT INTO qna_history (column_id, interaction_type, question, answer, round_no) "
+                "VALUES (?, 'confirmation', ?, ?, ?)",
+                [column_id, question, answer, round_no],
+            )
+            con.commit()
+            span.set_result("qna_history에 신규 기록됨")
+        else:
+            span.set_result("이미 기록되어 있어 중복 삽입 안 함")
+        con.close()
 
 
 # ── Tool: detect_month_like_columns (보유기간 추정용) ────────
-def detect_month_like_columns(con, table: str) -> list:
+def detect_month_like_columns(con, table: str, context: str = None) -> list:
     """
     'month' 컬럼이 없는 테이블(주로 dim 테이블)에서 시점을 나타낼 것으로
     추정되는 컬럼을 찾는다. 컬럼명에 'month'가 포함되고, 값이 전부
     YYYYMM 형태(190001~299912, 뒤 2자리 01~12)인 컬럼만 후보로 인정한다.
     """
-    candidates = con.execute(
-        "SELECT column_name FROM duckdb_columns() "
-        "WHERE database_name = 'data_db' AND table_name = ? "
-        "AND data_type IN ('BIGINT', 'INTEGER', 'HUGEINT', 'DOUBLE', 'FLOAT') "
-        "AND lower(column_name) LIKE '%month%'",
-        [table],
-    ).fetchall()
+    with tool_span("detect_month_like_columns", context=context) as span:
+        span.set_args({"table": table})
+        candidates = con.execute(
+            "SELECT column_name FROM duckdb_columns() "
+            "WHERE database_name = 'data_db' AND table_name = ? "
+            "AND data_type IN ('BIGINT', 'INTEGER', 'HUGEINT', 'DOUBLE', 'FLOAT') "
+            "AND lower(column_name) LIKE '%month%'",
+            [table],
+        ).fetchall()
 
-    month_like = []
-    safe_table = _safe_ident(table)
-    for (column_name,) in candidates:
-        safe_col = _safe_ident(column_name)
-        total, valid = con.execute(
-            f"SELECT COUNT(*), COUNT(*) FILTER ("
-            f"CAST({safe_col} AS BIGINT) BETWEEN 190001 AND 299912 "
-            f"AND CAST({safe_col} AS BIGINT) % 100 BETWEEN 1 AND 12"
-            f") FROM data_db.{safe_table} WHERE {safe_col} IS NOT NULL"
-        ).fetchone()
-        if total and total == valid:
-            month_like.append(column_name)
+        month_like = []
+        safe_table = _safe_ident(table)
+        for (column_name,) in candidates:
+            safe_col = _safe_ident(column_name)
+            total, valid = con.execute(
+                f"SELECT COUNT(*), COUNT(*) FILTER ("
+                f"CAST({safe_col} AS BIGINT) BETWEEN 190001 AND 299912 "
+                f"AND CAST({safe_col} AS BIGINT) % 100 BETWEEN 1 AND 12"
+                f") FROM data_db.{safe_table} WHERE {safe_col} IS NOT NULL"
+            ).fetchone()
+            if total and total == valid:
+                month_like.append(column_name)
+        span.set_result(month_like)
     return month_like
 
 
 # ── Tool: query_retention_period ───────────────────────────
-def query_retention_period(con, table: str, column: str) -> dict:
-    with tool_span("query_retention_period"):
+def query_retention_period(con, table: str, column: str, context: str = None) -> dict:
+    with tool_span("query_retention_period", context=context):
         has_month = con.execute(
             "SELECT COUNT(*) FROM duckdb_columns() "
             "WHERE database_name = 'data_db' AND table_name = ? AND column_name = 'month'",
@@ -227,7 +259,7 @@ def query_retention_period(con, table: str, column: str) -> dict:
             return {"start": row[0], "end": row[1], "estimated": False, "estimated_from": None}
 
         # month 컬럼이 없는 dim 테이블 등: month로 추정되는 컬럼으로 보유기간 추정
-        month_like_cols = detect_month_like_columns(con, table)
+        month_like_cols = detect_month_like_columns(con, table, context=context)
         if not month_like_cols:
             return {"start": None, "end": None, "estimated": False, "estimated_from": None}
 
@@ -270,6 +302,7 @@ def run_db_validation(meta_search_results: list, confirm_fn=None) -> list:
         table_id = meta_row["table_id"]
         column_name = meta_row["column_name"]
         column_id = meta_row["column_id"]
+        row_context = str(row.get("영문명") or column_name)
 
         exists_check = check_column_exists(con, table_id, column_name)
         out = dict(row)
@@ -289,23 +322,24 @@ def run_db_validation(meta_search_results: list, confirm_fn=None) -> list:
 
         actual_type = query_column_type(con, table_id, column_name)
         out["actual_type"] = actual_type  # 제공가능 type (실제 DB 기준)
-        match = compare_type_immediate(spec_type, actual_type)
+        match = compare_type_immediate(spec_type, actual_type, context=row_context)
 
         if match:
             out["final_type"] = actual_type
             out["type_match_status"] = "matched"
         else:
-            decision = request_type_confirmation(spec_type, actual_type, column_id, table_id, confirm_fn)
+            decision = request_type_confirmation(spec_type, actual_type, column_id, table_id, confirm_fn, context=row_context)
             log_confirmation_to_audit(
                 column_id,
                 question=f"{column_id}: spec={spec_type} vs actual={actual_type}, DB 기준 갱신?",
                 answer=decision,
+                context=row_context,
             )
             confirm = apply_type_confirmation(decision, spec_type, actual_type)
             out["final_type"] = confirm["final_type"]
             out["type_match_status"] = confirm["type_match_status"]
 
-        out["retention_period"] = query_retention_period(con, table_id, column_name)
+        out["retention_period"] = query_retention_period(con, table_id, column_name, context=row_context)
         results.append(out)
 
     con.close()

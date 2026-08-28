@@ -15,8 +15,18 @@ import sys
 import time
 import uuid
 import threading
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# Windows 콘솔 기본 코드페이지(cp949)는 이모지/일부 한글 조합을 못 그려서 print()가
+# UnicodeEncodeError로 죽는다 - 백엔드가 로그 한 줄 때문에 크래시 나면 안 되므로,
+# stdout/stderr를 UTF-8로 강제하고 인코딩 불가 문자는 죽는 대신 대체 문자로 넘어가게 한다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 from langgraph.types import Command
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -124,6 +134,152 @@ def _summarize_update(node_name: str, update: dict) -> str:
     return "처리 완료"
 
 
+# ── 콘솔 로그 (Option B: 파이프라인 실행 중 백엔드 터미널에 실시간 출력) ──────
+# 각 Agent의 Tool은 "무슨 기능인지"를 담당자가 아닌 사람도 이해할 수 있도록
+# 카테고리 - 쉬운 설명 형태로 표시한다. 같은 함수(예: exact_match_meta_db)를 여러
+# Agent가 공유해서 쓰는 경우 문맥이 다르므로, Agent별로 별도 사전을 두고
+# agent_label로 먼저 찾은 뒤 없으면 tool 이름만 그대로 보여준다.
+_TOOL_DESC_PARSING = {
+    "parse_excel_to_df": "제목줄 찾기",
+    "read_excel": "제목줄 찾기",
+    "rule_scan_header_row": "제목줄 찾기 - 규칙으로 먼저 시도",
+    "select_header_row_with_llm": "제목줄 찾기 - 애매하면 AI에게 물어보기",
+    "request_header_row_confirmation": "제목줄 찾기 - AI도 모르면 사람에게 직접 물어보기",
+    "map_columns_by_header": "컬럼헤더명 확인하기 - 키워드로 바로 알아보기",
+    "generate_header_mapping_judgment": "컬럼헤더명 확인하기 - 낯선 이름이면 AI에게 물어보기",
+    "header_field_confirmation": "컬럼헤더명 확인하기 - AI도 확신 못 하면 사람에게 직접 물어보기",
+    "validate_row_schema": "컬럼명 파악 - 최소한의 정보는 있는지 확인",
+    "find_row_completion": "컬럼명 파악 - 실제 데이터베이스에서 부족한 정보 찾아보기",
+    "exact_match_meta_db": "컬럼명 파악 - 실제 데이터베이스에서 부족한 정보 찾아보기(정확 매칭)",
+    "embed (retrieve_candidates)": "컬럼명 파악 - 실제 데이터베이스에서 부족한 정보 찾아보기(의미 검색)",
+    "infer_name_fields_with_llm": "컬럼명 파악 - 사전에도 없으면 AI가 추측하기",
+    "request_row_completion_confirmation": "컬럼명 파악 - 채운 값들을 사람에게 한번에 확인하기",
+    "map_candidate_tables": "컬럼명 파악 - 컬럼명으로 실제 어느 테이블에 있는지 미리 찾기",
+}
+
+_TOOL_DESC_META_SEARCH = {
+    "exact_match_meta_db": "동일이름 검색 - 이름이 완전히 똑같은지 찾아보기",
+    "request_table_disambiguation": "동일이름 검색 - 같은 이름이 여러 곳에 있으면 사람에게 확인",
+    "embed (retrieve_candidates)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "vss_search (column_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "vss_search (glossary_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "vss_search (confirmed_mapping_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "fuzzy_match_candidates": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "generate_match_judgment": "후보 목록 검색 - AI가 후보 중 하나를 골라보기",
+    "decide_route": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
+    "expand_retrieval_params": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
+    "request_inferred_confirmation": "후보 목록 검색 - 확신도와 상관없이 사람에게 최종 확인받기",
+    "apply_confirmation_result": "후보 목록 검색 - 사람의 결정을 최종 결과에 반영하기",
+    "update_meta_tag": "확정 결과 기록 - 최종 판정을 DB에 기록하기",
+    "persist_confirmed_mapping_example": "확정 결과 기록 - 검증된 매칭을 \"사전\"에 저장해두기",
+    "log_confirmation_to_audit": "확정 결과 기록 - 담당자가 무엇을 왜 승인/거절했는지 이력 남기기",
+    "get_table_relationships": "확정 결과 기록 - 다른 테이블과 연결될 수 있는지도 같이 확인해두기",
+}
+
+_TOOL_DESC_DB_VALIDATION = {
+    "get_guarded_connection": "DB 연결 - 읽기 전용으로만 연결하기",
+    "validate_query_structure": "DB 연결 - 수정, 삭제 같은 위험한 명령 걸러내기",
+    "check_column_exists": "데이터 확인 - 실제로 존재하는지 확인",
+    "query_column_type": "데이터 확인 - 데이터 종류 비교하기",
+    "compare_type_immediate": "데이터 확인 - 데이터 종류 비교하기",
+    "request_type_confirmation": "데이터 확인 - 데이터 종류 다르면 담당자에게 확인받기",
+    "detect_month_like_columns": "데이터 시점 확인 - 시점 나타내는 열 찾기",
+    "query_retention_period": "데이터 시점 확인 - 보유기간 계산하기",
+}
+
+_TOOL_DESC_JOIN_RESOLUTION = {
+    "load_table_relationships": "기존 관계 확인 - 기존 연결 관계 불러오기",
+    "find_join_path": "기존 관계 확인 - 기존 연결 관계 불러오기",
+    "find_shared_identifier_columns": "기존 관계 없는 경우, 조인 후보 검색 - 이름이 같은 열 찾기",
+    "find_semantic_key_candidates": "기존 관계 없는 경우, 조인 후보 검색 - 뜻이 비슷한 열 찾기",
+    "check_value_overlap": "조인 후보 확인 - 실제 값이 겹치는지 세어보기",
+    "request_join_key_confirmation": "조인 후보 확인 - 담당자에게 최종 확인받기",
+    "persist_confirmed_relationship": "조인 후보 확인 - 확정된 연결 저장해두기",
+    "validate_join_path": "조인 후보 실 검증 - 종류·기간 맞는지 점검",
+    "find_missing_join_key_columns": "조인 후보 목록 추가",
+    "request_missing_key_confirmation": "조인 후보 목록 추가",
+}
+
+_TOOL_DESC_CLASSIFICATION = {
+    "classify_existence": "존재 여부 판정",
+    "tag_from_type_status": "종류(타입) 불일치 반영",
+    "compare_period": "기간 비교하기",
+    "intersect_periods": "기간 비교하기",
+}
+
+_TOOL_DESC_REPORT = {
+    "aggregate_results": "결과 취합하기",
+    "build_join_report": "조인 결과 따로 모으기",
+    "generate_excel_report": "엑셀로 만들기",
+    "compute_summary_stats": "요약 통계 내기",
+    "log_revision_snapshot": "변경 이력 남기기",
+}
+
+# agent_label(instrument_agent에 준 라벨)의 접두어로 어느 사전을 쓸지 고른다.
+# 예: "Meta Search Agent (retrieve)"도 "Meta Search Agent"로 시작하므로 매칭된다.
+_TOOL_DESC_BY_AGENT = {
+    "Parsing Agent": _TOOL_DESC_PARSING,
+    "Meta Search Agent": _TOOL_DESC_META_SEARCH,
+    "DB Validation Agent": _TOOL_DESC_DB_VALIDATION,
+    "Join Resolution Agent": _TOOL_DESC_JOIN_RESOLUTION,
+    "Classification Agent": _TOOL_DESC_CLASSIFICATION,
+    "Report Agent": _TOOL_DESC_REPORT,
+}
+
+
+def _tool_desc(tool_name: str, agent_label: str = None) -> str:
+    if agent_label:
+        for prefix, table in _TOOL_DESC_BY_AGENT.items():
+            if not agent_label.startswith(prefix):
+                continue
+            for key, desc in table.items():
+                if tool_name.startswith(key):
+                    return desc
+            break  # agent는 찾았는데 그 사전엔 없으면, 다른 Agent 사전은 뒤지지 않는다
+    # agent_label이 없거나 매핑이 안 되면(과거 호출부 호환) 전체 사전에서 찾아본다
+    for table in _TOOL_DESC_BY_AGENT.values():
+        for key, desc in table.items():
+            if tool_name.startswith(key):
+                return desc
+    return tool_name
+
+
+def _print_console_log(node_name: str, agent_label: str, trace: dict | None, summary: str) -> None:
+    """실측 tool_calls(모델/입력/결정 포함)를 콘솔에 그대로 흘려보낸다.
+    trace가 없으면(instrument_agent로 계측 안 된 노드) 노드 완료 한 줄만 찍는다."""
+    tool_calls = trace.get("tool_calls", []) if trace else []
+    if not tool_calls:
+        now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{now}] 📍 [{agent_label}] {summary}")
+        return
+
+    for tc in tool_calls:
+        ts = datetime.fromtimestamp(tc["start"]).strftime("%H:%M:%S.%f")[:-3]
+        # 진짜 담당자 확인(HITL) 함수는 전부 이름에 명시적으로 "(HITL)"을 붙이는 관례를
+        # 따른다(request_table_disambiguation (HITL) 등). "confirmation" 부분 매칭이나
+        # request_ 접두어로 판정하면 log_confirmation_to_audit(기록만 함)나
+        # apply_confirmation_result(변환만 함)처럼 사람에게 아무것도 안 묻는 함수까지
+        # 🙋로 오인되므로 쓰지 않는다.
+        is_hitl = "HITL" in tc["tool"]
+        marker = "🙋" if is_hitl else "🔧"
+        ctx_suffix = f" ({tc['context']})" if tc.get("context") else ""
+        print(f"[{ts}] 📍 [{agent_label}] → [{tc['tool']} : {_tool_desc(tc['tool'], agent_label)}]{ctx_suffix}")
+        print(f"   {marker} Tool: {tc['tool']}  ({tc['duration_sec']}s{'  ok' if tc['ok'] else '  FAILED'})")
+        if tc.get("model"):
+            print(f"   🤖 Model: {tc['model']}")
+        if tc.get("args") is not None:
+            print(f"   📝 Args: {tc['args']}")
+        if tc.get("result") is not None:
+            print(f"   💬 {tc['result']}")
+        if not tc.get("ok") and tc.get("error"):
+            print(f"   ❌ Error: {tc['error']}")
+
+    hitl_count = sum(1 for tc in tool_calls if "HITL" in tc["tool"] or "confirmation" in tc["tool"])
+    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{now}] 📝 [{agent_label}] 완료 — {summary}"
+          f"{f' (담당자 확인 {hitl_count}회)' if hitl_count else ''}")
+
+
 class PipelineRun:
     def __init__(self, thread_id: str, input_file: str):
         self.thread_id = thread_id
@@ -146,6 +302,22 @@ class PipelineRun:
         now = time.time()
         elapsed = round(now - self._last_event_time, 2)
         self._last_event_time = now
+
+        tool_calls = trace.get("tool_calls", []) if trace else []
+        # NODE_METADATA["model"]은 "이 노드가 LLM을 쓸 수 있다"는 고정 안내문일 뿐, 이번 실행에서
+        # 실제로 호출됐는지는 알려주지 않는다(예: 규칙만으로 다 해결되면 LLM을 전혀 안 씀).
+        # tool_span이 실제로 기록한 tool_calls의 model 필드가 있으면 그걸 실측값으로 우선 사용한다.
+        actual_models = sorted({tc["model"] for tc in tool_calls if tc.get("model")})
+        if actual_models:
+            model_label = ", ".join(actual_models)
+        elif trace is not None:
+            # trace_log는 있지만(=instrument_agent로 계측된 노드) 실제 모델 호출은 0건
+            model_label = "(모델 호출 없음 - 규칙만으로 해결됨)"
+        else:
+            # 애초에 계측 안 된 노드(트레이스 자체가 없음) - 기존 고정 라벨로 폴백
+            model_label = meta["model"]
+
+        summary = _summarize_update(node_name, update)
         with self.lock:
             self.events.append({
                 "seq": len(self.events),
@@ -153,16 +325,19 @@ class PipelineRun:
                 "node": node_name,
                 "label": meta["label"],
                 "tool": meta["tool"],
-                "model": meta["model"],
+                "model": model_label,
                 "level": meta.get("level", "step"),
                 "plan_step": meta.get("plan_step"),
                 "elapsed_sec": elapsed,
-                "summary": _summarize_update(node_name, update),
+                "summary": summary,
                 "agent_start": trace.get("agent_start") if trace else None,
                 "agent_end": trace.get("agent_end") if trace else None,
                 "agent_duration_sec": trace.get("agent_duration_sec") if trace else None,
-                "tool_calls": trace.get("tool_calls", []) if trace else [],
+                "tool_calls": tool_calls,
             })
+
+        agent_label = (trace or {}).get("agent") or meta["label"]
+        _print_console_log(node_name, agent_label, trace, summary)
 
     def push_plan_announcement(self):
         now = time.time()

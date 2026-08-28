@@ -104,33 +104,36 @@ def build_join_report(join_results: list) -> pd.DataFrame:
     """명세서가 여러 테이블을 동시에 요청할 때, 그 테이블들을 실제로 하나의
     결과셋으로 조인할 수 있는지를 별도 시트로 보여준다. 컬럼별 '제공가능' 판정과
     달리, 여기서는 두 컬럼을 각각 받을 수 있어도 합쳐서 못 뽑는 경우를 잡아낸다."""
-    rows = []
-    for r in join_results or []:
-        if r["status"] == "resolved":
-            period = r.get("joined_period")
-            rows.append({
-                "테이블A": r["table_a"],
-                "테이블B": r["table_b"],
-                "조인키": r.get("join_key"),
-                "판정": "조인 가능",
-                "근거출처": JOIN_SOURCE_LABEL.get(r["source"], r["source"]),
-                "신뢰도": r.get("confidence"),
-                "타입일치": "일치" if r.get("type_consistent") else "불일치",
-                "조인가능기간(교집합)": _fmt_period(period) if period else "산출 불가(보유기간 정보 없음)",
-                "근거": r.get("evidence"),
-            })
-        else:
-            rows.append({
-                "테이블A": r["table_a"],
-                "테이블B": r["table_b"],
-                "조인키": None,
-                "판정": "조인 불가",
-                "근거출처": JOIN_SOURCE_LABEL.get(r.get("source"), r.get("source") or "-"),
-                "신뢰도": None,
-                "타입일치": None,
-                "조인가능기간(교집합)": None,
-                "근거": r.get("evidence"),
-            })
+    with tool_span("build_join_report") as span:
+        span.set_args({"join_results_count": len(join_results or [])})
+        rows = []
+        for r in join_results or []:
+            if r["status"] == "resolved":
+                period = r.get("joined_period")
+                rows.append({
+                    "테이블A": r["table_a"],
+                    "테이블B": r["table_b"],
+                    "조인키": r.get("join_key"),
+                    "판정": "조인 가능",
+                    "근거출처": JOIN_SOURCE_LABEL.get(r["source"], r["source"]),
+                    "신뢰도": r.get("confidence"),
+                    "타입일치": "일치" if r.get("type_consistent") else "불일치",
+                    "조인가능기간(교집합)": _fmt_period(period) if period else "산출 불가(보유기간 정보 없음)",
+                    "근거": r.get("evidence"),
+                })
+            else:
+                rows.append({
+                    "테이블A": r["table_a"],
+                    "테이블B": r["table_b"],
+                    "조인키": None,
+                    "판정": "조인 불가",
+                    "근거출처": JOIN_SOURCE_LABEL.get(r.get("source"), r.get("source") or "-"),
+                    "신뢰도": None,
+                    "타입일치": None,
+                    "조인가능기간(교집합)": None,
+                    "근거": r.get("evidence"),
+                })
+        span.set_result(f"조인 결과 {len(rows)}건 (가능 {sum(1 for r in rows if r['판정'] == '조인 가능')}건)")
     return pd.DataFrame(rows)
 
 
@@ -201,13 +204,16 @@ def generate_excel_report(merged_df: pd.DataFrame, output_path: str = "./output_
 
 # ── Tool: compute_summary_stats ────────────────────────────
 def compute_summary_stats(merged_df: pd.DataFrame) -> dict:
-    tag_counts = merged_df["최종태그"].value_counts().to_dict()
-    path_counts = merged_df["resolution_path"].value_counts().to_dict()
-    return {
-        "total": len(merged_df),
-        "tag_counts": tag_counts,
-        "resolution_path_counts": path_counts,
-    }
+    with tool_span("compute_summary_stats") as span:
+        tag_counts = merged_df["최종태그"].value_counts().to_dict()
+        path_counts = merged_df["resolution_path"].value_counts().to_dict()
+        result = {
+            "total": len(merged_df),
+            "tag_counts": tag_counts,
+            "resolution_path_counts": path_counts,
+        }
+        span.set_result(result)
+    return result
 
 
 # ── Tool: log_revision_snapshot ────────────────────────────

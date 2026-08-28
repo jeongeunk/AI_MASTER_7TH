@@ -34,32 +34,68 @@ def _finish_trace(token, created):
     return events
 
 
-class tool_span:
-    """with tool_span("retrieve_candidates", model="text-embedding-3-large"): ...
-    현재 활성화된 trace 수집기에 이 구간의 실행 정보를 기록한다.
-    활성 수집기가 없으면(트레이싱 밖에서 단독 호출된 경우) 아무 것도 하지 않는다."""
+def _brief(value, limit: int = 200):
+    """로그에 그대로 찍기엔 너무 큰 값(DataFrame, 긴 리스트 등)을 짧은 문자열로 요약한다."""
+    if value is None:
+        return None
+    s = repr(value)
+    return s if len(s) <= limit else s[:limit] + "...(생략)"
 
-    def __init__(self, tool_name: str, model: str = None):
+
+class tool_span:
+    """with tool_span("retrieve_candidates", model="text-embedding-3-large") as span: ...
+    현재 활성화된 trace 수집기에 이 구간의 실행 정보를 기록한다.
+    활성 수집기가 없으면(트레이싱 밖에서 단독 호출된 경우) 아무 것도 하지 않는다.
+
+    span.set_args(...)/span.set_result(...)로 입력값·반환값(요약)을 함께 남길 수 있다 -
+    특히 담당자 확인(HITL) 지점처럼 "무엇을 근거로 뭘 결정했는지"가 소요시간만큼 중요한
+    경우를 위한 것이다. 둘 다 선택 사항이며, 안 부르면 기존과 동일하게 동작한다.
+
+    context는 "지금 몇 번째 행/컬럼을 처리 중인지"처럼, 같은 tool이 루프 안에서 여러 번
+    불릴 때 로그에서 구분하기 위한 짧은 태그다(예: "행2: avg_data_amt"). 생성 시점에 몰라도
+    span.set_context(...)로 나중에 채울 수 있다.
+
+    예외가 나면(ok=False) exc_type/exc 메시지를 "error"로 함께 남긴다."""
+
+    def __init__(self, tool_name: str, model: str = None, context: str = None):
         self.tool_name = tool_name
         self.model = model
+        self.context = context
+        self.args = None
+        self.result = None
         self._start = None
 
     def __enter__(self):
         self._start = time.time()
         return self
 
+    def set_args(self, args) -> None:
+        self.args = _brief(args)
+
+    def set_result(self, result) -> None:
+        self.result = _brief(result)
+
+    def set_context(self, context: str) -> None:
+        self.context = context
+
     def __exit__(self, exc_type, exc, tb):
         end = time.time()
         collector = _current_trace.get()
         if collector is not None:
-            collector.append({
+            entry = {
                 "tool": self.tool_name,
                 "model": self.model,
+                "context": self.context,
                 "start": self._start,
                 "end": end,
                 "duration_sec": round(end - self._start, 3),
                 "ok": exc_type is None,
-            })
+                "args": self.args,
+                "result": self.result,
+            }
+            if exc_type is not None:
+                entry["error"] = f"{exc_type.__name__}: {exc}"
+            collector.append(entry)
         return False  # 예외는 그대로 전파
 
 
