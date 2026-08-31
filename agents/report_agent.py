@@ -256,7 +256,13 @@ def run_report(meta_results: list, classified_results: list, join_results: list 
                 reason=f"resolution_path={row['resolution_path']}",
             )
 
-    return {"excel_path": excel_path, "stats": stats}
+    return {
+        "excel_path": excel_path,
+        "stats": stats,
+        # KPI2(자동 판별 커버리지) 계측용 - 이미 계산된 최종태그를 그대로 재사용
+        # (metrics_store.py에서 같은 로직을 다시 만들지 않도록 여기서 흘려보냄)
+        "rows": merged_df[["영문명", "최종태그", "resolution_path"]].to_dict("records"),
+    }
 
 
 def _build_output_filename(input_file_path: str) -> str:

@@ -87,6 +87,7 @@ class PipelineState(TypedDict, total=False):
     classified_results: list
     report_excel_path: Optional[str]
     report_stats: Optional[dict]
+    report_rows: list  # KPI2(자동 판별 커버리지) 계측용 - 영문명별 최종태그(run_metrics 적재용)
 
     trace_log: Optional[dict]  # 노드 실행의 tool-call 트레이스(pipeline_runner가 읽어 모니터링에 표시)
 
@@ -329,7 +330,11 @@ def report_node(state: PipelineState) -> dict:
         state["meta_results"], state["classified_results"],
         join_results=state.get("join_results"), input_file_path=state["input_file"],
     )
-    return {"report_excel_path": result["excel_path"], "report_stats": result["stats"]}
+    return {
+        "report_excel_path": result["excel_path"],
+        "report_stats": result["stats"],
+        "report_rows": result.get("rows", []),
+    }
 
 
 # ── 그래프 빌드 ──────────────────────────────────────────────

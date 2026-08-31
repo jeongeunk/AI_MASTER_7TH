@@ -425,6 +425,7 @@ def _run_stream(run: PipelineRun, graph_app, config: dict):
             log_run_metrics(
                 run.thread_id, run.input_file, final_state.get("meta_results", []),
                 run.started_at, run_completed_at,
+                report_rows=final_state.get("report_rows", []),
             )
             run.status = "done"
             return

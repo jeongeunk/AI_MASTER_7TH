@@ -8,7 +8,7 @@ Swagger UI: http://localhost:8000/docs
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.api import specs, pipeline
+from backend.api import specs, pipeline, kpi
 
 app = FastAPI(title="SchemaScout API", version="1.0.0")
 
@@ -22,6 +22,7 @@ app.add_middleware(
 
 app.include_router(specs.router, prefix="/api")
 app.include_router(pipeline.router, prefix="/api")
+app.include_router(kpi.router, prefix="/api")
 
 
 @app.get("/health")
