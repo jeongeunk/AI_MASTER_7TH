@@ -8,37 +8,20 @@ import os
 import sys
 import shutil
 import uuid
-from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from pydantic import BaseModel
 
 from agents.parsing_agent import run_parsing
 
 router = APIRouter()
 
-
-# ── 응답 스키마 (reference/개발가이드_v2.md Week3 Step2 "모든 입출력 스키마" 반영) ─
-class UploadSpecResponse(BaseModel):
-    upload_id: str
-    file_path: str
-    total_count: int
-    success_count: int
-    fail_count: int
-    header_mapping_status: str
-    unresolved_header_fields: list
-    rows: list          # 원본 행 순서 그대로 전체(성공/확인필요 모두 포함) - 업로드 화면 통합 표용
-    failed_rows: list   # 하위 호환 (실패 사유만 따로 보고 싶을 때)
-    preview: list        # 하위 호환 (성공분만 보고 싶을 때)
-    trace: Optional[dict] = None  # 모니터링 화면 표시용: 시작/종료/소요시간 + tool 호출 내역
-
 UPLOAD_DIR = os.path.abspath(os.environ.get("UPLOAD_DIR", "./data/uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-@router.post("/specs/upload", response_model=UploadSpecResponse)
+@router.post("/specs/upload")
 async def upload_spec(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="xlsx 파일만 업로드할 수 있습니다.")
@@ -66,17 +49,7 @@ async def upload_spec(file: UploadFile = File(...)):
         # (실제 담당자 확인 UI는 /api/pipeline/start 이후 모니터링 화면에서 처리)
         result = run_parsing(save_path, confirm_fn=lambda payload: {"decision": "rejected"})
     except Exception as e:  # noqa: BLE001
-        # 파일은 이미 저장돼 있다(위 open()) - 미리보기(동기)는 실패했어도 담당자 확인이
-        # 가능한 실제 파이프라인(/api/pipeline/start, interrupt 지원)에서는 처리될 수 있는
-        # 경우가 많다(예: 헤더 행 판별처럼 규칙+LLM 둘 다 실패해 사람 확인이 꼭 필요한 파일).
-        # detail을 문자열이 아니라 객체로 줘서, 프론트가 "미리보기 없이 파이프라인 시작"
-        # 버튼을 곧장 보여줄 수 있게 file_path를 함께 실어 보낸다.
-        raise HTTPException(status_code=422, detail={
-            "message": f"파싱 실패: {e}",
-            "file_path": save_path,
-            "hint": "규칙/LLM 자동 처리로는 부족해 담당자 확인이 필요한 파일일 수 있습니다. "
-                    "미리보기 없이 파이프라인을 직접 시작하면 담당자 확인 화면(모니터링)에서 처리할 수 있습니다.",
-        })
+        raise HTTPException(status_code=422, detail=f"파싱 실패: {e}")
 
     return {
         "upload_id": upload_id,

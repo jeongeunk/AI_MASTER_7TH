@@ -15,12 +15,10 @@ KPI3·4만 eng_name으로 특정 컬럼 필터링이 가능하다.
 
 import os
 import sys
-from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fastapi import APIRouter
-from pydantic import BaseModel
 
 from evaluation.run_metrics_kpi_report import (
     compute_coverage,
@@ -37,19 +35,7 @@ from evaluation.run_metrics_kpi_report import (
 router = APIRouter()
 
 
-# ── 응답 스키마 (reference/개발가이드_v2.md Week3 Step2 "모든 입출력 스키마" 반영) ─
-# available=False일 때는 message만 채워지고, True일 때는 4개 KPI 집계 결과가 채워지는
-# 2가지 형태를 하나의 모델로 표현(둘 다 Optional).
-class KpiReportResponse(BaseModel):
-    available: bool
-    message: Optional[str] = None
-    processing_time: Optional[dict] = None
-    coverage: Optional[dict] = None
-    reproducibility: Optional[dict] = None
-    retrieval_attempts: Optional[dict] = None
-
-
-@router.get("/kpi/report", response_model=KpiReportResponse)
+@router.get("/kpi/report")
 def get_kpi_report(eng_name: str = None):
     con = get_connection()
     try:

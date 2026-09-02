@@ -5,8 +5,6 @@ backend/api/pipeline.py
 - GET  /api/pipeline/{thread_id}/events        : 노드별 진행 로그 폴링 (tool/LLM 정보 포함)
 - POST /api/pipeline/{thread_id}/confirm       : 담당자 확인 응답 제출
       - 단순 승인/거절: {"decision": "approved"} 또는 {"decision": "rejected"}
-      - Meta Search(inferred_confirmation) 후보군조회: {"decision": "more_candidates"}
-        (확정하지 않고 floor 없이 순위 기반으로 다음 후보를 더 보여달라는 요청)
       - 헤더 매핑 확인처럼 부가 정보가 필요한 경우:
         {"decision": {"decision": "approved", "selected_column": "컬럼명"}}
         또는 {"decision": {"decision": "rejected"}}
@@ -15,7 +13,7 @@ backend/api/pipeline.py
 """
 
 import os
-from typing import Optional, Union
+from typing import Union
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -31,32 +29,6 @@ from backend.core.pipeline_runner import (
 )
 
 router = APIRouter()
-
-
-# ── 응답 스키마 (reference/개발가이드_v2.md Week3 Step2 "모든 입출력 스키마" 반영) ─
-# /download는 파일(FileResponse)을 그대로 스트리밍하는 엔드포인트라 JSON 스키마 대상이 아니다.
-
-class StartResponse(BaseModel):
-    thread_id: str
-
-
-class EventsResponse(BaseModel):
-    events: list
-    next_since: int
-    status: str  # running | waiting_human | done | error
-    confirm_payload: Optional[dict] = None
-    report: Optional[dict] = None
-    error: Optional[str] = None
-
-
-class ConfirmResponse(BaseModel):
-    ok: bool
-
-
-class ResultsResponse(BaseModel):
-    ready: bool
-    rows: list = []
-    stats: Optional[dict] = None
 
 
 def _validate_file_path(file_path: str) -> str:
@@ -77,29 +49,24 @@ class StartRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     # 기존(Meta Search/DB Validation): 단순 문자열 "approved" | "rejected"
-    # Meta Search(inferred_confirmation) 전용 3번째 값: "more_candidates" - 확정하지 않고
-    # floor 없이 순위 기반으로 다음 후보를 더 보여달라는 요청(자동재시도와는 별개).
     # 신규(헤더 매핑 확인 등 부가 정보가 필요한 케이스): {"decision": "approved"|"rejected", ...추가필드}
     decision: Union[str, dict]
 
 
-_VALID_DECISIONS = ("approved", "rejected", "more_candidates")
-
-
 def _validate_decision(decision: Union[str, dict]) -> None:
     if isinstance(decision, str):
-        if decision not in _VALID_DECISIONS:
-            raise HTTPException(status_code=400, detail=f"decision 문자열은 {_VALID_DECISIONS} 중 하나여야 합니다.")
+        if decision not in ("approved", "rejected"):
+            raise HTTPException(status_code=400, detail="decision 문자열은 approved 또는 rejected여야 합니다.")
         return
     if isinstance(decision, dict):
         inner = decision.get("decision")
-        if inner not in _VALID_DECISIONS:
-            raise HTTPException(status_code=400, detail=f"decision.decision 필드는 {_VALID_DECISIONS} 중 하나여야 합니다.")
+        if inner not in ("approved", "rejected"):
+            raise HTTPException(status_code=400, detail="decision.decision 필드는 approved 또는 rejected여야 합니다.")
         return
     raise HTTPException(status_code=400, detail="decision은 문자열 또는 객체여야 합니다.")
 
 
-@router.post("/pipeline/start", response_model=StartResponse)
+@router.post("/pipeline/start")
 def start(req: StartRequest):
     safe_path = _validate_file_path(req.file_path)
     if not os.path.exists(safe_path):
@@ -108,7 +75,7 @@ def start(req: StartRequest):
     return {"thread_id": thread_id}
 
 
-@router.get("/pipeline/{thread_id}/events", response_model=EventsResponse)
+@router.get("/pipeline/{thread_id}/events")
 def events(thread_id: str, since: int = 0):
     try:
         return get_events_since(thread_id, since)
@@ -116,7 +83,7 @@ def events(thread_id: str, since: int = 0):
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.post("/pipeline/{thread_id}/confirm", response_model=ConfirmResponse)
+@router.post("/pipeline/{thread_id}/confirm")
 def confirm(thread_id: str, req: ConfirmRequest):
     _validate_decision(req.decision)
     try:
@@ -128,7 +95,7 @@ def confirm(thread_id: str, req: ConfirmRequest):
     return {"ok": True}
 
 
-@router.get("/pipeline/{thread_id}/results", response_model=ResultsResponse)
+@router.get("/pipeline/{thread_id}/results")
 def results(thread_id: str):
     try:
         return get_results(thread_id)

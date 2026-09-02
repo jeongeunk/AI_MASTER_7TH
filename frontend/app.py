@@ -15,7 +15,7 @@ import html
 
 import streamlit as st
 
-from api_client import api_client
+from api_client import api_client, SpecParsingFailed
 from sidebar_progress import render_sidebar_progress
 
 st.set_page_config(page_title="SchemaScout", page_icon="🔍", layout="wide")
@@ -75,12 +75,45 @@ if uploaded_file is not None and upload_clicked:
     with st.spinner("파싱 중..."):
         try:
             result = api_client.upload_spec(uploaded_file.getvalue(), uploaded_file.name)
+        except SpecParsingFailed as e:
+            # 미리보기(동기)는 실패했지만 파일은 이미 저장돼 있을 수 있다 - 그 경우
+            # 담당자 확인이 되는 실제 파이프라인으로 바로 넘어갈 길을 열어준다.
+            st.session_state["upload_result"] = None
+            st.session_state["parsing_failed"] = {"message": e.message, "file_path": e.file_path, "hint": e.hint}
         except Exception as e:
+            st.session_state["upload_result"] = None
+            st.session_state["parsing_failed"] = None
             st.error(f"업로드 실패: {e}")
         else:
             st.session_state["upload_result"] = result
             st.session_state["upload_trace"] = result.get("trace")
+            st.session_state["parsing_failed"] = None
             st.session_state.pop("thread_id", None)  # 새 업로드 시 이전 파이프라인 상태 초기화
+
+parsing_failed = st.session_state.get("parsing_failed")
+if parsing_failed:
+    st.warning(f"⚠️ 미리보기 파싱 실패: {parsing_failed['message']}")
+    if parsing_failed.get("file_path"):
+        st.info(parsing_failed.get("hint") or "담당자 확인이 필요한 파일일 수 있습니다.")
+        if st.button("미리보기 없이 파이프라인 시작", type="primary"):
+            with st.spinner("파이프라인 시작 중..."):
+                try:
+                    start_result = api_client.start_pipeline(parsing_failed["file_path"])
+                except Exception as e:
+                    st.error(f"파이프라인 시작 실패: {e}")
+                else:
+                    st.session_state["thread_id"] = start_result["thread_id"]
+                    st.session_state["events"] = []
+                    st.session_state["events_since"] = 0
+                    st.session_state["events_thread_id"] = start_result["thread_id"]
+                    st.session_state.pop("sidebar_events", None)
+                    st.session_state.pop("sidebar_events_since", None)
+                    st.session_state.pop("sidebar_events_thread_id", None)
+                    st.session_state["parsing_failed"] = None
+                    st.success(f"파이프라인 시작됨: `{start_result['thread_id']}`")
+                    st.info("왼쪽 사이드바에서 진행 상황을 바로 확인하거나, "
+                            "'모니터링' 페이지로 이동해 담당자 확인을 진행하세요.")
+                    st.rerun()
 
 upload_result = st.session_state.get("upload_result")
 

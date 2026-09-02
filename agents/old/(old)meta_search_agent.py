@@ -127,8 +127,6 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
         span.set_args({"description": description})
         resp = embed_fn("DEPLOYMENT_EMBED_LARGE", description)
         span.set_result(f"{len(resp.data[0].embedding)}차원 벡터 생성 완료")
-        if getattr(resp, "usage", None):
-            span.set_tokens(resp.usage.prompt_tokens, 0)  # 임베딩은 completion 토큰 없음
     query_vec = resp.data[0].embedding
 
     merged = {}  # column_id -> candidate dict (가장 점수 높은 것 유지)
@@ -304,7 +302,7 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
         ],
     }
 
-    with tool_span("generate_match_judgment", model="gpt-5-mini") as span:
+    with tool_span("generate_match_judgment", model="gpt-5-mini"):
         resp = chat_fn(
             "DEPLOYMENT_GPT5_MINI",
             [
@@ -315,8 +313,6 @@ def generate_match_judgment(column_meta: dict, candidates: list, chat_fn=None) -
             # gpt-5-mini는 reasoning 계열이라 temperature 커스텀 값을 지원하지 않음
             # (400 Unsupported value: 'temperature' ... Only the default (1) value is supported.)
         )
-        if getattr(resp, "usage", None):
-            span.set_tokens(resp.usage.prompt_tokens, resp.usage.completion_tokens)
 
     message = resp.choices[0].message
     judgment = getattr(message, "parsed", None)
@@ -379,30 +375,6 @@ def expand_retrieval_params(attempt_no: int, context: str = None) -> dict:
     return params
 
 
-# ── Tool: get_more_candidates ("후보군조회" 전용) ───────────
-# expand_retrieval_params(자동재시도)와 목적이 다르다: 자동재시도는 후보가 0건일 때
-# 최소 1건이라도 찾기 위한 "품질 문턱(floor)을 단계적으로 낮추는" 재검색이고, 이 함수는
-# 이미 후보가 있는 상태에서 담당자가 화면에서 명시적으로 "더 보여달라"고 요청했을 때만
-# 쓰인다. floor 문턱을 아예 적용하지 않고(순위 기반) 전체 후보를 점수순으로 정렬해두고,
-# 이미 보여준 column_id(exclude_ids)를 제외한 다음 순위를 그대로 보여준다 - 그래서 정답의
-# 유사도가 자동재시도의 최저 floor(0.55)보다 낮아도(예: outgoing_time -> total_og_mou
-# 0.543) 언젠가는 반드시 노출된다. 두 메커니즘은 재시도 횟수(retrieval_attempts) 예산을
-# 공유하지 않는다 - 자동재시도가 이미 예산을 다 썼어도 담당자의 후보군조회는 영향받지 않는다.
-def get_more_candidates(con, eng_name: str, description: str, embed_fn,
-                         exclude_ids: set, top_k: int = 5,
-                         pool_size: int = 30, context: str = None) -> list:
-    with tool_span("get_more_candidates", context=context) as span:
-        span.set_args({"eng_name": eng_name, "exclude_count": len(exclude_ids), "top_k": top_k})
-        pool = retrieve_candidates(
-            con, eng_name, description, embed_fn,
-            top_k=pool_size, floor=0.0, include_glossary_boost=True, context=context,
-        )
-        remaining = [c for c in pool if c["column_id"] not in exclude_ids]
-        result = remaining[:top_k]
-        span.set_result(f"신규 후보 {len(result)}건 (전체 풀 {len(pool)}건 중 미노출 {len(remaining)}건)")
-    return result
-
-
 # ── Tool: request_inferred_confirmation (담당자 확인) ──────
 def _console_confirm(payload: dict) -> str:
     print("\n" + "=" * 60)
@@ -412,22 +384,14 @@ def _console_confirm(payload: dict) -> str:
     print(f"  LLM 확신도  : {payload['llm_confidence']}")
     print(f"  LLM 근거    : {payload['llm_evidence']}")
     for c in payload["candidates"]:
-        desc = f" - {c['description']}" if c.get("description") else ""
-        print(f"    - 후보: {c['column_name']} ({c['source']}, score={c['score']}){desc}")
-    if payload.get("candidates_exhausted"):
-        print("  (더 이상 새로운 후보가 없습니다 - 전체 후보 풀을 모두 보여드렸습니다)")
+        print(f"    - 후보: {c['column_name']} ({c['source']}, score={c['score']})")
     print("=" * 60)
-    ans = input("이 매칭을 승인(y) / 후보군조회(m) / 거절(n): ").strip().lower()
-    if ans == "y":
-        return "approved"
-    if ans == "m":
-        return "more_candidates"
-    return "rejected"
+    ans = input("이 매칭을 승인하시겠습니까? (y/n): ").strip().lower()
+    return "approved" if ans == "y" else "rejected"
 
 
 def request_inferred_confirmation(column_meta: dict, candidates: list, judgment: dict,
-                                   confirm_fn=None, candidates_exhausted: bool = False,
-                                   context: str = None) -> str:
+                                   confirm_fn=None, context: str = None) -> str:
     # 프롬프트 인젝션 방어(보조 장치) - 명세서 원본 값에 지시문처럼 보이는 문구가
     # 섞여 있으면 자동으로 걸러내지 않고 담당자 확인 화면에 경고만 추가로 띄운다.
     injection_warning = scan_for_injection_risk(
@@ -440,18 +404,11 @@ def request_inferred_confirmation(column_meta: dict, candidates: list, judgment:
         "description": column_meta.get("항목설명"),
         "llm_confidence": judgment["confidence"],
         "llm_evidence": judgment["evidence"],
-        # LLM이 후보 중 추천한 것 - 화면의 라디오 버튼 기본 선택값으로 쓰인다. 사람은
-        # 이 추천을 그대로 승인할 수도, 다른 후보를 직접 골라 승인할 수도 있다.
-        "recommended_column_id": judgment.get("selected_column_id"),
         "candidates": [
             {"column_id": c["column_id"], "column_name": c["meta_row"]["column_name"],
-             "source": c["source"], "score": c["score"],
-             "description": c["meta_row"].get("description")}
+             "source": c["source"], "score": c["score"]}
             for c in candidates
         ],
-        # "후보군조회" 버튼을 화면에서 비활성화할지 판단하는 용도 - 후보 풀이 소진되면
-        # 더 눌러도 새 후보가 안 나오므로 이 사실을 사람에게 미리 알려준다.
-        "candidates_exhausted": candidates_exhausted,
         "injection_warning": injection_warning,
     }
     fn = confirm_fn or _console_confirm
@@ -468,9 +425,6 @@ def apply_confirmation_result(decision: str, context: str = None) -> dict:
         span.set_args({"decision": decision})
         if decision == "approved":
             result = {"final_tag": "inferred_confirmed", "confirmation_status": "approved"}
-        elif decision == "more_candidates":
-            # 아직 확정이 아니다 - 후보를 더 보여준 뒤 다시 확인받는 중간 상태.
-            result = {"final_tag": None, "confirmation_status": "more_candidates"}
         else:
             result = {"final_tag": "unresolved", "confirmation_status": "rejected"}
         span.set_result(result)
@@ -650,11 +604,9 @@ def persist_confirmed_mapping_example(con, row: dict, embed_fn) -> None:
     if not embed_text:
         return
 
-    with tool_span("persist_confirmed_mapping_example", model="text-embedding-3-large") as span:
+    with tool_span("persist_confirmed_mapping_example"):
         resp = embed_fn("DEPLOYMENT_EMBED_LARGE", embed_text)
         vec = resp.data[0].embedding
-        if getattr(resp, "usage", None):
-            span.set_tokens(resp.usage.prompt_tokens, 0)
     con.execute(
         "INSERT INTO confirmed_mapping_examples "
         "(example_id, eng_name, kor_name, description, column_id, confirmation_source) "
@@ -808,28 +760,7 @@ def run_meta_search(parsed_rows: list, embed_fn, confirm_fn=None, chat_fn=None) 
                 # 루프 계속 (재검색)
 
             else:  # human_confirm
-                # "후보군조회"는 자동재시도(retrieve_candidates의 floor 완화)와 별개로,
-                # floor 없이 순위 기반으로 다음 후보를 계속 붙여가며 같은 컬럼에 대해
-                # 반복 확인한다 - 재검색 횟수(attempts) 예산과는 무관하다.
-                shown_ids = {c["column_id"] for c in candidates}
-                exhausted = False
-                while True:
-                    decision = request_inferred_confirmation(
-                        row, candidates, judgment, confirm_fn,
-                        candidates_exhausted=exhausted, context=row_context,
-                    )
-                    if decision != "more_candidates":
-                        break
-                    more = get_more_candidates(
-                        con, eng_name, str(row["항목설명"]), embed_fn,
-                        exclude_ids=shown_ids, context=row_context,
-                    )
-                    if not more:
-                        exhausted = True
-                        continue
-                    candidates = candidates + more
-                    shown_ids.update(c["column_id"] for c in more)
-                    judgment = generate_match_judgment(row, candidates, chat_fn=chat_fn)
+                decision = request_inferred_confirmation(row, candidates, judgment, confirm_fn, context=row_context)
                 confirm_result = apply_confirmation_result(decision, context=row_context)
                 target_column_id = judgment.get("selected_column_id") or (candidates[0]["column_id"] if candidates else None)
                 if target_column_id:

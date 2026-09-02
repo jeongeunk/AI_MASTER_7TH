@@ -56,6 +56,23 @@ def _render_tool_calls(tool_calls: list):
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
+def _render_injection_warning(warnings: list):
+    """prompt_guard.scan_for_injection_risk()가 찾아낸 의심 문구를 담당자 확인
+    화면에 경고 배지로 보여준다. 자동 차단이 아니라 "확인 시 주의해서 보라"는
+    용도라, 아래 승인/거절 버튼 자체를 막지는 않는다."""
+    if not warnings:
+        return
+    items = "".join(f"<li>\"{w['text']}\" (탐지 문구: {w['pattern']})</li>" for w in warnings)
+    st.markdown(
+        "<div style='background:#FDEAEA;border:1px solid #F5B5B5;border-radius:8px;"
+        "padding:8px 12px;margin:6px 0;font-size:13px;color:#9B2C2C;'>"
+        "⚠️ <b>프롬프트 인젝션 의심</b> — 명세서 원본 텍스트에 AI에게 지시하는 것처럼 보이는 "
+        "문구가 포함되어 있습니다. 내용을 확인한 뒤 승인 여부를 판단하세요."
+        f"<ul style='margin:4px 0 0 18px;'>{items}</ul></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_agent_trace_card(trace: dict):
     """Agent 시작/종료/소요시간 + 그 안에서 호출된 tool 목록(모델 포함)을 카드 형태로 표시."""
     if not trace:
@@ -206,6 +223,8 @@ def _live_pipeline_panel(thread_id: str):
                 for a in payload["attempts"]:
                     st.markdown(f"- **{a['method']}**: {a['detail']}")
 
+                _render_injection_warning(payload.get("injection_warning"))
+
                 st.markdown("**시트 미리보기**")
                 preview_df = pd.DataFrame([
                     {"row_idx": r["row_idx"], **{f"col{i}": v for i, v in enumerate(r["preview"])}}
@@ -223,15 +242,51 @@ def _live_pipeline_panel(thread_id: str):
             elif payload["type"] == "inferred_confirmation":
                 st.markdown(f"**원본 컬럼**: {payload['eng_name']} / {payload['kor_name']}")
                 st.markdown(f"**원본 설명**: {payload['description']}")
+                _render_injection_warning(payload.get("injection_warning"))
                 st.markdown(f"**LLM 확신도**: {payload.get('llm_confidence', payload.get('similarity_score'))}")
                 st.markdown(f"**LLM 근거**: {payload.get('llm_evidence', payload.get('match_evidence', ''))}")
+                selected_candidate_id = None
                 if "candidates" in payload:
-                    st.markdown("**후보**")
-                    st.dataframe(payload["candidates"], use_container_width=True)
+                    candidates = payload["candidates"]
+                    st.markdown(f"**후보** ({len(candidates)}건) — 승인할 후보를 하나 선택하세요")
+                    recommended = payload.get("recommended_column_id")
+                    option_ids = [c["column_id"] for c in candidates]
+                    default_idx = option_ids.index(recommended) if recommended in option_ids else 0
+
+                    def _cand_label(cid, _candidates=candidates, _rec=recommended):
+                        c = next(x for x in _candidates if x["column_id"] == cid)
+                        desc = f" · {c['description']}" if c.get("description") else ""
+                        rec_mark = " ⭐ LLM 추천" if cid == _rec else ""
+                        return f"{c['column_name']} (유사도 {c['score']}, {c['source']}){rec_mark}{desc}"
+
+                    selected_candidate_id = st.radio(
+                        "승인할 후보 선택", option_ids, index=default_idx,
+                        format_func=_cand_label, key=f"inf_radio_{thread_id}",
+                        label_visibility="collapsed",
+                    )
                 elif "candidate_column" in payload:
                     st.markdown(f"**매칭 후보**: {payload['candidate_column']} ({payload['candidate_table']})")
                     st.markdown(f"**후보 설명**: {payload['candidate_description']}")
-                approve_label, reject_label = "✅ 승인", "❌ 거절"
+
+                exhausted = payload.get("candidates_exhausted", False)
+                ic1, ic2, ic3 = st.columns(3)
+                if ic1.button("✅ 승인", type="primary", use_container_width=True,
+                               key=f"inf_approve_{thread_id}"):
+                    if selected_candidate_id:
+                        api_client.confirm(thread_id, {"decision": "approved", "selected_column_id": selected_candidate_id})
+                    else:
+                        api_client.confirm(thread_id, "approved")
+                    st.rerun()
+                if ic2.button("🔎 후보군조회", use_container_width=True, disabled=exhausted,
+                               key=f"inf_more_{thread_id}"):
+                    api_client.confirm(thread_id, "more_candidates")
+                    st.rerun()
+                if ic3.button("❌ 거절", use_container_width=True, key=f"inf_reject_{thread_id}"):
+                    api_client.confirm(thread_id, "rejected")
+                    st.rerun()
+                if exhausted:
+                    st.caption("더 이상 새로운 후보가 없습니다 (전체 후보 풀을 모두 보여드렸습니다)")
+                custom_ui_handled = True
 
             elif payload["type"] == "table_disambiguation_confirmation":
                 st.markdown(f"**`{payload['eng_name']}` 컬럼명이 여러 테이블에 동일하게 존재합니다**")
@@ -291,6 +346,8 @@ def _live_pipeline_panel(thread_id: str):
                 for a in payload["attempts"]:
                     st.markdown(f"- **{a['method']}**: {a['detail']}")
 
+                _render_injection_warning(payload.get("injection_warning"))
+
                 st.markdown("**원본 헤더**")
                 headers = payload["all_headers"]
                 cols = st.columns(len(headers))
@@ -320,6 +377,17 @@ def _live_pipeline_panel(thread_id: str):
                 st.caption("승인한 행만 추정값이 반영되고, 거절/미승인 행은 원래대로 파싱 실패 처리됩니다. "
                            "(이미 값이 있던 필드는 건드리지 않습니다)")
 
+                flagged = [c for c in candidates if c.get("injection_warning")]
+                if flagged:
+                    st.markdown(
+                        "<div style='background:#FDEAEA;border:1px solid #F5B5B5;border-radius:8px;"
+                        "padding:8px 12px;margin:6px 0;font-size:13px;color:#9B2C2C;'>"
+                        f"⚠️ <b>프롬프트 인젝션 의심</b> — 아래 표의 \"인젝션 의심\" 컬럼에 표시된 "
+                        f"{len(flagged)}건은 원본 값에 AI에게 지시하는 것처럼 보이는 문구가 포함돼 "
+                        "있습니다. 내용을 확인한 뒤 승인 여부를 판단하세요.</div>",
+                        unsafe_allow_html=True,
+                    )
+
                 source_label = {"meta_db": "메타DB", "llm_inference": "LLM 추론"}
                 table_df = pd.DataFrame([
                     {
@@ -330,13 +398,14 @@ def _live_pipeline_panel(thread_id: str):
                         "출처": source_label.get(c["source"], c["source"]),
                         "확신도": c["confidence"],
                         "근거": c["evidence"],
+                        "인젝션 의심": "⚠️" if c.get("injection_warning") else "",
                     }
                     for c in candidates
                 ])
                 edited = st.data_editor(
                     table_df,
                     column_config={"승인": st.column_config.CheckboxColumn(help="체크한 행만 제안값을 반영합니다")},
-                    disabled=["row_index", "누락 필드", "제안값", "출처", "확신도", "근거"],
+                    disabled=["row_index", "누락 필드", "제안값", "출처", "확신도", "근거", "인젝션 의심"],
                     hide_index=True,
                     use_container_width=True,
                     key=f"row_completion_{thread_id}",

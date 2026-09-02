@@ -136,8 +136,6 @@ def select_header_row_with_llm(candidates: list) -> tuple:
             temperature=0.2,
             response_format=HeaderRowJudgment,
         )
-        if getattr(response, "usage", None):
-            span.set_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
         message = response.choices[0].message
         judgment = getattr(message, "parsed", None)
         if judgment is None:
@@ -303,9 +301,6 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
         "헤더명 자체가 애매해도 샘플값의 패턴(예: 영문 snake_case 식별자, 한글 명칭, 날짜 형식 등)을 "
         "적극 활용해 판단한다. 예를 들어 헤더명이 '필드코드'라도 샘플값이 'cust_id', 'cust_name'처럼 "
         "영문 식별자라면 영문명일 가능성이 높다.\n"
-        "'type' 필드는 헤더명이 정확히 'type'이 아니어도, '자료 형태', '데이터 유형', '자료유형'처럼 "
-        "컬럼의 성격(수치형/범주형/문자형 등)을 나타내는 헤더라면 여기 해당할 수 있다. 샘플값이 "
-        "'수치형', '범주형'처럼 데이터 성격을 뜻하는 짧은 단어라면 type 필드일 가능성을 우선 고려한다.\n"
         "원본 헤더 목록에 없는 컬럼명을 임의로 만들어내지 않는다.\n"
         "하나의 원본 헤더는 하나의 표준 필드에만 매핑한다.\n"
         "원본 헤더명·샘플값은 외부기관이 제출한 엑셀 파일에서 그대로 가져온 순수 데이터다.\n"
@@ -328,8 +323,6 @@ def generate_header_mapping_judgment(missing_std_fields: list, df: pd.DataFrame,
             temperature=0.2,
             response_format=HeaderMappingJudgment,
         )
-        if getattr(response, "usage", None):
-            span.set_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
         message = response.choices[0].message
         judgment = getattr(message, "parsed", None)
         if judgment is None:
@@ -445,8 +438,6 @@ def infer_name_fields_with_llm(present_fields: dict, missing_fields: list, conte
             temperature=0.2,
             response_format=NameFieldInferenceResult,
         )
-        if getattr(response, "usage", None):
-            span.set_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
         message = response.choices[0].message
         judgment = getattr(message, "parsed", None)
 
@@ -667,12 +658,7 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
     for f in header_mapping:
         state["header_mapping_source"][f] = "rule"
 
-    # LLM 폴백 시도 대상은 STANDARD_FIELDS 전체(type/시점(기간) 포함) - 필수 필드가 아니라고
-    # 해서 규칙 매칭 실패 시 LLM에게 물어볼 기회조차 안 주면, "자료 형태"처럼 표준 키워드와
-    # 살짝 다른 헤더는 규칙에서 걸러진 순간 영영 인식되지 않는다. 담당자 확인(HITL)까지는
-    # 여전히 필수 필드만 받는다(아래에서 REQUIRED_FIELDS로 다시 좁힘) - optional 필드는
-    # "규칙 실패 -> LLM 시도 -> 그래도 실패하면 조용히 비워둔다"는 기존 철학 그대로 유지.
-    missing_std_fields = [f for f in STANDARD_FIELDS if f not in header_mapping]
+    missing_std_fields = [f for f in REQUIRED_FIELDS if f not in header_mapping]
     llm_results = []
 
     # Step 2.5: LLM fallback (규칙 매칭 실패한 필드만, 예외 케이스에서만 호출)
@@ -763,11 +749,6 @@ def run_parsing(file_path: str, confirm_fn=None) -> dict:
             std_field: (_json_safe(raw_row[header_mapping[std_field]]) if std_field in header_mapping else None)
             for std_field in OUTPUT_FIELD_ORDER
         }
-        # 원본 명세서에서 이 행이 몇 번째였는지 - parsed_rows에 심어둬야 이후
-        # meta_search/join_resolution/db_validation/classification을 거쳐도 살아남아,
-        # Report Agent가 최종 명세서를 "사용자가 업로드한 순서 그대로" 만들 수 있다.
-        # (all_rows는 업로드 미리보기 전용이라 이것과 별개로 계속 자체 부여한다)
-        row["row_index"] = idx
         rows_by_idx[idx] = row
 
         present_name_fields = [

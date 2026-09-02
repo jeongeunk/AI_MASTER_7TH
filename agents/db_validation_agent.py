@@ -135,11 +135,26 @@ def query_column_type(con, table: str, column: str) -> str:
     return row[0] if row else None
 
 
+# "수치형"/"범주형"처럼 명세서가 실제 DB 타입명이 아니라 상위 분류로 type을 적어오는
+# 경우를 위한 동의어 매핑. 값은 db/schemascout_data.duckdb를 실측(duckdb_columns())해
+# 확인된 실제 타입만 포함한다 - 새로운 타입이 실측되면 그때 추가한다.
+TYPE_SYNONYMS = {
+    "수치형": {"DOUBLE", "BIGINT", "UBIGINT", "INTEGER", "FLOAT"},
+    "범주형": {"VARCHAR"},
+}
+
+
 # ── Tool: compare_type_immediate ───────────────────────────
 def compare_type_immediate(spec_type: str, actual_type: str, context: str = None) -> bool:
     with tool_span("compare_type_immediate", context=context) as span:
         span.set_args({"spec_type": spec_type, "actual_type": actual_type})
-        match = str(spec_type).upper() == str(actual_type).upper()
+        synonyms = TYPE_SYNONYMS.get(str(spec_type).strip())
+        if synonyms is not None:
+            # "수치형"/"범주형" 같은 상위 분류는 실제 DB 타입 집합에 속하는지로 판정
+            match = str(actual_type).upper() in synonyms
+        else:
+            # 그 외(스펙에 이미 VARCHAR/DOUBLE처럼 실제 타입명이 적혀있는 경우)는 기존과 동일
+            match = str(spec_type).upper() == str(actual_type).upper()
         span.set_result(match)
     return match
 

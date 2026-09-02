@@ -11,13 +11,9 @@ add_conditional_edges로 재검색/담당자확인 갈래를 그래프 레벨에
                           테이블에 존재(ambiguous): meta_table_disambiguation / 매칭 없음: meta_retrieve)
     meta_retrieve -> (후보 없음: meta_no_match / 있음: meta_judge)
     meta_judge -> (retry / human_confirm)
-    meta_retry -> meta_retrieve (자동재시도 루프 - floor 완화, 최대 MAX_RETRIEVAL_ATTEMPTS회)
-    meta_human_confirm -> (승인/거절: 확정 후 다음 컬럼 또는 join_resolution /
-                            "후보군조회": meta_more_candidates)
-    meta_more_candidates -> meta_human_confirm (담당자가 명시적으로 요청한 경우만 - floor
-                             없이 순위 기반으로 다음 후보를 붙여 다시 보여준다. 자동재시도와
-                             달리 retrieval_attempts 예산을 공유하지 않는다)
-    meta_no_match / meta_table_disambiguation -> (다음 컬럼 또는 join_resolution)
+    meta_retry -> meta_retrieve (재검색 루프, 최대 MAX_RETRIEVAL_ATTEMPTS회)
+    meta_human_confirm / meta_no_match / meta_table_disambiguation
+        -> (다음 컬럼 또는 join_resolution)
 
 담당자 확인(interrupt/inferred)과 type 불일치 확인(interrupt/db_validation)은 기존과
 동일하게 노드 함수 내부에서 interrupt()를 호출하는 confirm_fn으로 처리한다.
@@ -25,10 +21,9 @@ add_conditional_edges로 재검색/담당자확인 갈래를 그래프 레벨에
 체크포인터로 SqliteSaver를 사용해 interrupt 대기 상태가 프로세스 재시작 후에도 유지됨.
 """
 
-import operator
 import os
 import sys
-from typing import Annotated, TypedDict, Optional
+from typing import TypedDict, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -46,7 +41,6 @@ from agents.meta_search_agent import (
     generate_match_judgment,
     decide_route,
     expand_retrieval_params,
-    get_more_candidates,
     request_inferred_confirmation,
     request_table_disambiguation,
     apply_confirmation_result,
@@ -55,14 +49,12 @@ from agents.meta_search_agent import (
     get_table_relationships,
     persist_confirmed_mapping_example,
     SIMILARITY_PREFILTER_FLOOR,
-    MAX_RETRIEVAL_ATTEMPTS,
 )
 from agents.join_resolution_agent import run_join_resolution
 from agents.db_validation_agent import run_db_validation
 from agents.classification_agent import run_classification
 from agents.report_agent import run_report
 from agents.trace import instrument_agent
-from backend.core.logging import make_log
 from llm_client import embed, chat_parsed
 
 load_dotenv()
@@ -88,10 +80,6 @@ class PipelineState(TypedDict, total=False):
     current_top_k: int
     current_floor: float
     current_glossary_boost: bool
-    # 담당자 확인(meta_human_confirm) 결과: "approved"|"more_candidates"|"rejected".
-    # "more_candidates"일 때만 확정하지 않고 meta_more_candidates로 되돌아간다.
-    human_confirm_decision: str
-    candidates_exhausted: bool  # "후보군조회"로 더 보여줄 후보가 바닥났는지(화면에서 버튼 비활성화용)
 
     join_results: list  # Join Resolution Agent: 여러 테이블을 요청한 명세서의 조인 가능성 검증 결과
 
@@ -102,10 +90,6 @@ class PipelineState(TypedDict, total=False):
     report_rows: list  # KPI2(자동 판별 커버리지) 계측용 - 영문명별 최종태그(run_metrics 적재용)
 
     trace_log: Optional[dict]  # 노드 실행의 tool-call 트레이스(pipeline_runner가 읽어 모니터링에 표시)
-
-    # 고수준 로그(reference/개발가이드_v2.md Week3 Step1 make_log) - 7대 구성요소 관점의
-    # 분류 레이어. operator.add로 각 노드가 반환한 로그가 계속 누적된다.
-    agent_logs: Annotated[list, operator.add]
 
 
 # ── interrupt() 기반 confirm_fn ────────────────────────────
@@ -132,26 +116,15 @@ def _enrich(con, result: dict) -> dict:
 @instrument_agent("Parsing Agent")
 def parsing_node(state: PipelineState) -> dict:
     result = run_parsing(state["input_file"], confirm_fn=graph_confirm_fn)
-    log = make_log(
-        component="Action", step="parsing",
-        summary=f"명세서 파싱 완료 - {len(result['parsed_rows'])}개 컬럼 구조화",
-        metadata={"count": len(result["parsed_rows"])},
-    )
-    return {"parsed_rows": result["parsed_rows"], "agent_logs": [log]}
+    return {"parsed_rows": result["parsed_rows"]}
 
 
 @instrument_agent("Meta Search Agent (서브플랜 초기화)")
 def meta_init_node(state: PipelineState) -> dict:
-    columns = state["parsed_rows"]
-    log = make_log(
-        component="Reasoning", step="meta_init",
-        summary=f"Meta Search 서브플랜 초기화 - {len(columns)}개 컬럼 대상",
-    )
     return {
-        "meta_columns": columns,
+        "meta_columns": state["parsed_rows"],
         "meta_index": 0,
         "meta_results": [],
-        "agent_logs": [log],
     }
 
 
@@ -172,36 +145,21 @@ def meta_exact_check_node(state: PipelineState) -> dict:
         out = _enrich(con, out)
         persist_confirmed_mapping_example(con, out, embed)
         con.close()
-        log = make_log(
-            component="Action", step="meta_exact_check",
-            summary=f"{col['영문명']}: 정확 매칭 확정(LLM 호출 없음)",
-        )
         return {
             "meta_results": state["meta_results"] + [out],
             "meta_index": idx + 1,
             "exact_found": True,
-            "agent_logs": [log],
         }
     if exact.get("ambiguous"):
         con.close()
-        log = make_log(
-            component="Action", step="meta_exact_check",
-            summary=f"{col['영문명']}: 동일 컬럼명이 {len(exact['candidates'])}개 테이블에 존재 - 담당자 선택 필요",
-        )
-        return {"exact_found": "ambiguous", "exact_candidates": exact["candidates"], "agent_logs": [log]}
+        return {"exact_found": "ambiguous", "exact_candidates": exact["candidates"]}
     con.close()
-    log = make_log(
-        component="Action", step="meta_exact_check",
-        summary=f"{col['영문명']}: 정확 매칭 실패 - RAG 후보 검색으로 전환",
-    )
     return {
         "exact_found": False,
         "retrieval_attempts": 0,
         "current_top_k": 5,
         "current_floor": SIMILARITY_PREFILTER_FLOOR,
         "current_glossary_boost": False,
-        "candidates_exhausted": False,
-        "agent_logs": [log],
     }
 
 
@@ -240,15 +198,9 @@ def meta_table_disambiguation_node(state: PipelineState) -> dict:
                "unresolved_reason": "ambiguous_table_rejected", "resolution_path": "rejected_by_human"}
     con.close()
 
-    log = make_log(
-        component="HITL", step="meta_table_disambiguation",
-        summary=f"{col['영문명']}: 담당자 테이블 선택 - {out['match_status']}",
-        detail=out["match_evidence"],
-    )
     return {
         "meta_results": state["meta_results"] + [out],
         "meta_index": state["meta_index"] + 1,
-        "agent_logs": [log],
     }
 
 
@@ -262,24 +214,11 @@ def meta_retrieve_node(state: PipelineState) -> dict:
         include_glossary_boost=state["current_glossary_boost"],
     )
     con.close()
-    log = make_log(
-        component="Memory", step="meta_retrieve",
-        summary=f"{col['영문명']}: RAG 후보 검색 완료 - {len(candidates)}건"
-                f"(컬럼 임베딩·용어집·Episodic Memory·fuzzy)",
-    )
-    return {"current_candidates": candidates, "agent_logs": [log]}
+    return {"current_candidates": candidates}
 
 
 def route_after_retrieve(state: PipelineState) -> str:
-    if state["current_candidates"]:
-        return "judge"
-    # 후보가 0건이어도 곧바로 실패 처리하지 않는다 - 1차 필터(SIMILARITY_PREFILTER_FLOOR)가
-    # 실제로 존재하는 컬럼을 걸러내는 경우가 있어(실측: mobile_number 0.672, fb_user 0.699 -
-    # 둘 다 0.75 문턱 미달로 1차 후보에서 빠짐), meta_retry_node가 이미 하는 "검색 범위 확대"를
-    # 재검색 횟수가 남아있는 한 여기서도 그대로 재사용한다.
-    if state["retrieval_attempts"] < MAX_RETRIEVAL_ATTEMPTS:
-        return "retry"
-    return "no_candidates"
+    return "judge" if state["current_candidates"] else "no_candidates"
 
 
 @instrument_agent("Meta Search Agent (no match)")
@@ -288,14 +227,9 @@ def meta_no_match_node(state: PipelineState) -> dict:
     out = {**col, "match_status": "unresolved", "meta_row": None,
            "match_evidence": "검색된 후보 없음", "unresolved_reason": "no_match",
            "resolution_path": "no_match", "retrieval_attempts": state["retrieval_attempts"]}
-    log = make_log(
-        component="Reasoning", step="meta_no_match",
-        summary=f"{col['영문명']}: 근거 없음 - 추측 없이 unresolved로 종결",
-    )
     return {
         "meta_results": state["meta_results"] + [out],
         "meta_index": state["meta_index"] + 1,
-        "agent_logs": [log],
     }
 
 
@@ -303,12 +237,7 @@ def meta_no_match_node(state: PipelineState) -> dict:
 def meta_judge_node(state: PipelineState) -> dict:
     col = state["meta_columns"][state["meta_index"]]
     judgment = generate_match_judgment(col, state["current_candidates"], chat_fn=chat_parsed)
-    log = make_log(
-        component="Reasoning", step="meta_judge",
-        summary=f"{col['영문명']}: LLM 판단 완료 - confidence {judgment['confidence']}",
-        detail=judgment.get("evidence", ""),
-    )
-    return {"current_judgment": judgment, "agent_logs": [log]}
+    return {"current_judgment": judgment}
 
 
 def route_by_judgment(state: PipelineState) -> str:
@@ -319,16 +248,11 @@ def route_by_judgment(state: PipelineState) -> str:
 def meta_retry_node(state: PipelineState) -> dict:
     attempts = state["retrieval_attempts"] + 1
     params = expand_retrieval_params(attempts)
-    log = make_log(
-        component="Feedback", step="meta_retry",
-        summary=f"검색 범위 확대 후 재검색({attempts}회차) - 후보 없음/확신도 애매/담당자 거절",
-    )
     return {
         "retrieval_attempts": attempts,
         "current_top_k": params["top_k"],
         "current_floor": params["floor"],
         "current_glossary_boost": params["include_glossary_boost"],
-        "agent_logs": [log],
     }
 
 
@@ -338,28 +262,10 @@ def meta_human_confirm_node(state: PipelineState) -> dict:
     judgment = state["current_judgment"]
     candidates = state["current_candidates"]
 
-    raw_decision = request_inferred_confirmation(
-        col, candidates, judgment, confirm_fn=graph_confirm_fn,
-        candidates_exhausted=state.get("candidates_exhausted", False),
-    )
-    # 화면에서 라디오 버튼으로 후보를 직접 골라 승인한 경우 {"decision": "approved",
-    # "selected_column_id": ...} 형태(dict)로 온다 - 그 외(후보군조회/거절, 콘솔 확인)는
-    # 기존처럼 단순 문자열이다.
-    if isinstance(raw_decision, dict):
-        decision = raw_decision.get("decision")
-        picked_column_id = raw_decision.get("selected_column_id")
-    else:
-        decision = raw_decision
-        picked_column_id = None
+    decision = request_inferred_confirmation(col, candidates, judgment, confirm_fn=graph_confirm_fn)
     apply_confirmation_result(decision)  # 반환값은 아래에서 재구성하므로 로깅 목적만
 
-    # 사람이 화면에서 직접 고른 후보를 최우선으로 쓰고, 없으면 LLM 추천, 그마저 없으면
-    # 후보 1순위로 폴백한다(기존 동작 보존).
-    target_column_id = (
-        picked_column_id
-        or judgment.get("selected_column_id")
-        or (candidates[0]["column_id"] if candidates else None)
-    )
+    target_column_id = judgment.get("selected_column_id") or (candidates[0]["column_id"] if candidates else None)
     if target_column_id:
         log_confirmation_to_audit(
             target_column_id,
@@ -371,115 +277,27 @@ def meta_human_confirm_node(state: PipelineState) -> dict:
     if decision == "approved" and target_column_id:
         selected = next((c for c in candidates if c["column_id"] == target_column_id), candidates[0])
         update_meta_tag(con, selected["column_id"], "inferred_confirmed", confidence=judgment["confidence"])
-        # 담당자가 LLM 추천과 다른 후보를 직접 골랐다면, 근거 문구도 그 사실을 반영한다
-        # (그렇지 않으면 다른 후보를 골랐는데 LLM의 원래 추천 근거가 그대로 남아 혼동됨).
-        manual_pick = bool(picked_column_id) and picked_column_id != judgment.get("selected_column_id")
-        match_evidence = (
-            f"담당자가 후보 중 {selected['meta_row']['column_name']}을(를) 직접 선택(LLM 추천: "
-            f"{judgment.get('selected_column_id') or '없음'})"
-            if manual_pick else judgment["evidence"]
-        )
         out = {**col, "match_status": "inferred_confirmed", "meta_row": selected["meta_row"],
-               "match_evidence": match_evidence, "llm_confidence": judgment["confidence"],
+               "match_evidence": judgment["evidence"], "llm_confidence": judgment["confidence"],
                "llm_evidence": judgment["evidence"], "resolution_path": "validated",
                "retrieval_attempts": state["retrieval_attempts"]}
         out = _enrich(con, out)
         persist_confirmed_mapping_example(con, out, embed)
-        con.close()
-
-        log = make_log(
-            component="HITL", step="meta_human_confirm",
-            summary=f"{col['영문명']}: 담당자 확인 - {out['match_status']}(승인)",
-            detail=out["match_evidence"],
-        )
-        return {
-            "meta_results": state["meta_results"] + [out],
-            "meta_index": state["meta_index"] + 1,
-            "human_confirm_decision": "approved",
-            "agent_logs": [log],
-        }
-
-    if decision == "more_candidates":
-        # 확정하지 않고 meta_more_candidates로 되돌아간다 - meta_index는 그대로 두고
-        # 같은 컬럼에 대해 후보만 더 붙여서 다시 확인받는다. 재검색 횟수(attempts) 예산과는
-        # 무관하므로 여기서는 retrieval_attempts를 건드리지 않는다.
-        con.close()
-        log = make_log(
-            component="HITL", step="meta_human_confirm",
-            summary=f"{col['영문명']}: 담당자가 후보군조회 요청",
-        )
-        return {"human_confirm_decision": "more_candidates", "agent_logs": [log]}
-
-    # 거절 - 재검색 없이 즉시 unresolved로 확정한다. "더 넓게 찾아봐 달라"는 요청은
-    # 별도의 "후보군조회" 버튼으로 명시적으로 눌러야 하고, "거절"은 그 자체로 최종 결정이다.
-    if target_column_id:
-        update_meta_tag(con, target_column_id, "unresolved", confidence=judgment["confidence"])
-    out = {**col, "match_status": "unresolved", "meta_row": None,
-           "match_evidence": "담당자 확인 결과 거절", "unresolved_reason": "rejected_by_human",
-           "resolution_path": "rejected_by_human", "retrieval_attempts": state["retrieval_attempts"]}
+    else:
+        if target_column_id:
+            update_meta_tag(con, target_column_id, "unresolved", confidence=judgment["confidence"])
+        out = {**col, "match_status": "unresolved", "meta_row": None,
+               "match_evidence": "담당자 확인 결과 거절", "unresolved_reason": "rejected_by_human",
+               "resolution_path": "rejected_by_human", "retrieval_attempts": state["retrieval_attempts"]}
     con.close()
 
-    log = make_log(
-        component="HITL", step="meta_human_confirm",
-        summary=f"{col['영문명']}: 담당자 확인 - {out['match_status']}(거절)",
-        detail=out["match_evidence"],
-    )
     return {
         "meta_results": state["meta_results"] + [out],
         "meta_index": state["meta_index"] + 1,
-        "human_confirm_decision": "rejected",
-        "agent_logs": [log],
-    }
-
-
-@instrument_agent("Meta Search Agent (후보군조회)")
-def meta_more_candidates_node(state: PipelineState) -> dict:
-    """담당자가 화면에서 "후보군조회"를 눌렀을 때만 진입한다. 자동재시도(meta_retry)와
-    달리 floor 문턱 없이 순위 기반으로, 이미 보여준 후보를 제외한 다음 순위를 그대로
-    덧붙인다 - 그래서 정답의 유사도가 자동재시도의 최저 floor보다 낮아도 언젠가는 반드시
-    노출된다(실측: outgoing_time -> total_og_mou 0.543). 새 후보가 생기면 LLM 판단도
-    확장된 후보 전체를 대상으로 다시 받아, 승인 시 어떤 후보가 선택된 것인지 반영한다."""
-    col = state["meta_columns"][state["meta_index"]]
-    candidates = state["current_candidates"]
-    shown_ids = {c["column_id"] for c in candidates}
-
-    con = _get_meta_con()
-    more = get_more_candidates(
-        con, str(col["영문명"]).strip(), str(col["항목설명"]), embed, exclude_ids=shown_ids,
-    )
-    con.close()
-
-    if not more:
-        log = make_log(
-            component="Feedback", step="meta_more_candidates",
-            summary=f"{col['영문명']}: 더 보여줄 후보 없음 - 전체 후보 풀 소진(누적 {len(candidates)}건)",
-        )
-        return {"candidates_exhausted": True, "agent_logs": [log]}
-
-    merged_candidates = candidates + more
-    judgment = generate_match_judgment(col, merged_candidates, chat_fn=chat_parsed)
-    log = make_log(
-        component="Feedback", step="meta_more_candidates",
-        summary=f"{col['영문명']}: 담당자 요청으로 후보 {len(more)}건 추가 노출"
-                f"(floor 없이 순위 기반, 누적 {len(merged_candidates)}건)",
-    )
-    return {
-        "current_candidates": merged_candidates,
-        "current_judgment": judgment,
-        "candidates_exhausted": False,
-        "agent_logs": [log],
     }
 
 
 def route_after_resolution(state: PipelineState) -> str:
-    return "done" if state["meta_index"] >= len(state["meta_columns"]) else "next_column"
-
-
-def route_after_human_confirm(state: PipelineState) -> str:
-    """meta_human_confirm 전용 라우팅 - 담당자가 "후보군조회"를 요청했을 때만 확정하지
-    않고 meta_more_candidates로 되돌아간다(meta_index를 아직 안 늘렸으므로 같은 컬럼)."""
-    if state.get("human_confirm_decision") == "more_candidates":
-        return "more_candidates"
     return "done" if state["meta_index"] >= len(state["meta_columns"]) else "next_column"
 
 
@@ -490,34 +308,20 @@ def join_resolution_node(state: PipelineState) -> dict:
     # meta_results를 갱신본으로 교체 - 조인에 필요한데 요청 목록에 없던 키 컬럼이
     # 담당자 승인으로 추가됐다면, 이후 DB Validation부터는 이 갱신본을 이어받아야
     # 추가된 키도 다른 요청 컬럼과 똑같이 검증되고 리포트에 노출된다.
-    log = make_log(
-        component="Action", step="join_resolution",
-        summary=f"조인 가능성 검증 완료 - {len(result['join_results'])}쌍 확인"
-                f"(신규 추가 컬럼 {len(result['meta_results']) - len(state['meta_results'])}건)",
-    )
-    return {"join_results": result["join_results"], "meta_results": result["meta_results"],
-            "agent_logs": [log]}
+    return {"join_results": result["join_results"], "meta_results": result["meta_results"]}
 
 
 # ── 노드 정의: 이후 단계 (기존과 동일) ─────────────────────────
 @instrument_agent("DB Validation Agent")
 def db_validation_node(state: PipelineState) -> dict:
     results = run_db_validation(state["meta_results"], confirm_fn=graph_confirm_fn)
-    log = make_log(
-        component="Action", step="db_validation",
-        summary=f"실 DB 검증 완료 - {len(results)}건(존재·타입·보유기간 조회)",
-    )
-    return {"validation_results": results, "agent_logs": [log]}
+    return {"validation_results": results}
 
 
 @instrument_agent("Classification Agent")
 def classification_node(state: PipelineState) -> dict:
     results = run_classification(state["validation_results"])
-    log = make_log(
-        component="Evaluation", step="classification",
-        summary=f"최종 태그 확정 완료 - {len(results)}건(존재→타입→기간 순, 규칙 기반 자동)",
-    )
-    return {"classified_results": results, "agent_logs": [log]}
+    return {"classified_results": results}
 
 
 @instrument_agent("Report Agent")
@@ -526,16 +330,10 @@ def report_node(state: PipelineState) -> dict:
         state["meta_results"], state["classified_results"],
         join_results=state.get("join_results"), input_file_path=state["input_file"],
     )
-    log = make_log(
-        component="Action", step="report",
-        summary=f"최종 리포트 생성 완료 - {result['stats'].get('total', 0)}건",
-        metadata=result["stats"],
-    )
     return {
         "report_excel_path": result["excel_path"],
         "report_stats": result["stats"],
         "report_rows": result.get("rows", []),
-        "agent_logs": [log],
     }
 
 
@@ -551,7 +349,6 @@ def build_graph():
     graph.add_node("meta_judge", meta_judge_node)
     graph.add_node("meta_retry", meta_retry_node)
     graph.add_node("meta_human_confirm", meta_human_confirm_node)
-    graph.add_node("meta_more_candidates", meta_more_candidates_node)
     graph.add_node("meta_table_disambiguation", meta_table_disambiguation_node)
     graph.add_node("join_resolution", join_resolution_node)
     graph.add_node("db_validation", db_validation_node)
@@ -569,7 +366,7 @@ def build_graph():
     )
     graph.add_conditional_edges(
         "meta_retrieve", route_after_retrieve,
-        {"judge": "meta_judge", "retry": "meta_retry", "no_candidates": "meta_no_match"},
+        {"judge": "meta_judge", "no_candidates": "meta_no_match"},
     )
     graph.add_conditional_edges(
         "meta_judge", route_by_judgment,
@@ -577,19 +374,11 @@ def build_graph():
     )
     graph.add_edge("meta_retry", "meta_retrieve")
 
-    for node_name in ("meta_no_match", "meta_table_disambiguation"):
+    for node_name in ("meta_human_confirm", "meta_no_match", "meta_table_disambiguation"):
         graph.add_conditional_edges(
             node_name, route_after_resolution,
             {"next_column": "meta_exact_check", "done": "join_resolution"},
         )
-    # meta_human_confirm만 별도 라우팅 - 담당자가 "후보군조회"를 요청했을 때만 확정하지
-    # 않고 meta_more_candidates로 되돌아가 후보를 더 붙여 다시 보여준다. "거절"은 이제
-    # 재검색 없이 그 자리에서 바로 확정된다(next_column/done으로 직행).
-    graph.add_conditional_edges(
-        "meta_human_confirm", route_after_human_confirm,
-        {"more_candidates": "meta_more_candidates", "next_column": "meta_exact_check", "done": "join_resolution"},
-    )
-    graph.add_edge("meta_more_candidates", "meta_human_confirm")
 
     graph.add_edge("join_resolution", "db_validation")
     graph.add_edge("db_validation", "classification")

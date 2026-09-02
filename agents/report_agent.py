@@ -41,6 +41,14 @@ TAG_LABEL = {
 
 
 # ── Tool: aggregate_results ────────────────────────────────
+def _table_dot_column(source_table, meta_row: dict) -> str:
+    """"소속테이블"에 테이블명뿐 아니라 실제 매칭된 컬럼명까지 "테이블.컬럼" 형태로 보여준다."""
+    column_name = (meta_row or {}).get("column_name")
+    if source_table and column_name:
+        return f"{source_table}.{column_name}"
+    return source_table
+
+
 def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFrame:
     rows = []
 
@@ -58,16 +66,20 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
         rows.append({
             "영문명": r.get("영문명"),
             "한글명": r.get("한글명"),
-            "요청 type": r.get("spec_type"),
+            # "요청 type"은 명세서에 사용자가 실제로 적어 넣은 값 그대로(예: 수치형/범주형)를
+            # 보여준다. spec_type(메타DB에 등록된 실제 컬럼 타입, 예: BIGINT/DOUBLE)은
+            # DB 검증 단계의 내부 비교용일 뿐 사용자가 요청한 값이 아니므로 여기 노출하지 않는다.
+            "요청 type": r.get("type"),
             "제공가능 type": r.get("actual_type"),
             "요청시점(기간)": r.get("시점(기간)"),
             "제공가능시점(기간)": _fmt_period(r.get("final_period")),
             "항목설명": r.get("항목설명"),
-            "소속테이블": r.get("source_table"),
+            "소속테이블": _table_dot_column(r.get("source_table"), r.get("meta_row")),
             "최종태그": r.get("final_tag"),
             "근거": evidence,
             "resolution_path": resolution_path,
             "재검색 횟수": r.get("retrieval_attempts"),
+            "row_index": r.get("row_index"),  # 최종 정렬용(사용자가 업로드한 명세서 행 순서) - 출력 컬럼 아님
         })
 
     # 경로 B/C: Meta Search에서 조기 종결 (unresolved - 거절 또는 미매칭)
@@ -87,7 +99,13 @@ def aggregate_results(meta_results: list, classified_results: list) -> pd.DataFr
             "근거": r.get("match_evidence"),
             "resolution_path": r.get("unresolved_reason", "no_match"),
             "재검색 횟수": r.get("retrieval_attempts"),
+            "row_index": r.get("row_index"),
         })
+
+    # 사용자가 업로드한 명세서에 나열된 순서 그대로 최종 명세서를 만든다. row_index가
+    # 없는 행(예: Join Resolution이 조인을 위해 원래 요청에 없던 키 컬럼을 자동으로
+    # 추가한 경우 - join_key_added)은 원본 명세서에 없던 행이므로 맨 뒤로 보낸다.
+    rows.sort(key=lambda r: r["row_index"] if r["row_index"] is not None else float("inf"))
 
     return pd.DataFrame(rows)
 

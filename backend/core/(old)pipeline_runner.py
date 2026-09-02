@@ -35,8 +35,7 @@ import pandas as pd
 
 from agents.langgraph_pipeline import build_graph, CHECKPOINT_DB_PATH
 from agents.report_agent import aggregate_results, _compute_tag_label
-from backend.core.metrics_store import log_run_metrics, log_token_usage, get_token_usage_summary
-from backend.core.logging import format_log_for_display
+from backend.core.metrics_store import log_run_metrics
 
 
 def _json_safe(value):
@@ -61,7 +60,6 @@ NODE_METADATA = {
     "meta_judge": {"label": "AI 매칭 판단", "tool": "generate_match_judgment", "model": "gpt-5-mini", "level": "decision", "plan_step": "2/6"},
     "meta_retry": {"label": "재검색 준비", "tool": "expand_retrieval_params", "model": None, "level": "self_correction", "plan_step": "2/6"},
     "meta_human_confirm": {"label": "담당자 확인 대기", "tool": "request_inferred_confirmation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
-    "meta_more_candidates": {"label": "후보군조회(담당자 요청)", "tool": "get_more_candidates (floor 없이 순위 기반)", "model": "gpt-5-mini (확장된 후보 재판단)", "level": "self_correction", "plan_step": "2/6"},
     "meta_table_disambiguation": {"label": "테이블 선택 대기", "tool": "request_table_disambiguation (interrupt)", "model": None, "level": "human", "plan_step": "2/6"},
     "join_resolution": {"label": "조인 가능성 검증", "tool": "find_join_path / generate_join_key_candidates / check_value_overlap", "model": None, "level": "step", "plan_step": "3/6"},
     "db_validation": {"label": "실 DB 검증", "tool": "check_column_exists / query_column_type / query_retention_period", "model": None, "level": "step", "plan_step": "4/6"},
@@ -111,11 +109,6 @@ def _summarize_update(node_name: str, update: dict) -> str:
         return "검색 후보 없음 → unresolved 처리, DB Validation/Classification 스킵"
     if node_name == "meta_human_confirm":
         return "확신도 애매(0.70~0.92) → 자동 판단을 유보하고 담당자 확인으로 위임(interrupt)"
-    if node_name == "meta_more_candidates":
-        if update.get("candidates_exhausted"):
-            return "Self-Correction — 담당자가 후보군조회 요청 → floor 없이 순위 기반 재검색했으나 더 보여줄 후보 없음(풀 소진)"
-        n = len(update.get("current_candidates", []))
-        return f"Self-Correction — 담당자가 후보군조회 요청 → floor 없이 순위 기반으로 후보 확장(누적 {n}건) → 재판단 후 다시 확인 요청"
     if node_name == "meta_table_disambiguation":
         m = update.get("meta_results", [])
         last = m[-1] if m else {}
@@ -176,7 +169,6 @@ _TOOL_DESC_META_SEARCH = {
     "decide_route": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
     "expand_retrieval_params": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
     "request_inferred_confirmation": "후보 목록 검색 - 확신도와 상관없이 사람에게 최종 확인받기",
-    "get_more_candidates": "후보 목록 검색 - 사람이 더 보여달라고 하면 문턱 없이 다음 순위 보여주기",
     "apply_confirmation_result": "후보 목록 검색 - 사람의 결정을 최종 결과에 반영하기",
     "update_meta_tag": "확정 결과 기록 - 최종 판정을 DB에 기록하기",
     "persist_confirmed_mapping_example": "확정 결과 기록 - 검증된 매칭을 \"사전\"에 저장해두기",
@@ -307,7 +299,6 @@ class PipelineRun:
         meta = NODE_METADATA.get(node_name, {"label": node_name, "tool": node_name, "model": None, "level": "step", "plan_step": None})
         update = dict(update or {})
         trace = update.pop("trace_log", None)
-        agent_logs = update.pop("agent_logs", None) or []
         now = time.time()
         elapsed = round(now - self._last_event_time, 2)
         self._last_event_time = now
@@ -343,18 +334,10 @@ class PipelineRun:
                 "agent_end": trace.get("agent_end") if trace else None,
                 "agent_duration_sec": trace.get("agent_duration_sec") if trace else None,
                 "tool_calls": tool_calls,
-                "agent_logs": agent_logs,  # make_log() 고수준 로그(7대 구성요소 분류) - 트레이스 시각화 페이지용
             })
 
         agent_label = (trace or {}).get("agent") or meta["label"]
         _print_console_log(node_name, agent_label, trace, summary)
-
-        # make_log() 고수준 로그 콘솔 출력 - 이모지는 장식일 뿐이고 실제 정보는 항상
-        # "[구성요소] 요약" 대괄호 텍스트로 담는다(기존 tool_span 콘솔 로그와 같은 원칙).
-        # 콘솔 폰트가 이모지를 못 그려도 대괄호 텍스트는 항상 읽힌다.
-        for log in agent_logs:
-            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{ts}] {format_log_for_display(log)}")
 
     def push_plan_announcement(self):
         now = time.time()
@@ -444,22 +427,6 @@ def _run_stream(run: PipelineRun, graph_app, config: dict):
                 run.started_at, run_completed_at,
                 report_rows=final_state.get("report_rows", []),
             )
-
-            # 토큰 사용량 집계 - Report Agent까지 끝난 이 시점에는 run.events에 이번
-            # 실행에서 발생한 tool_call 전체가 이미 쌓여 있다(tool_span이 기록한 것).
-            # tokens 필드가 있는 것만(=LLM/임베딩 호출) 골라 감사 DB에 적재하고 콘솔에 남긴다.
-            token_calls = [
-                tc for ev in run.events for tc in (ev.get("tool_calls") or [])
-                if tc.get("tokens")
-            ]
-            log_token_usage(run.thread_id, run.input_file, token_calls)
-            usage_summary = get_token_usage_summary(run.thread_id)
-            if usage_summary["total"]:
-                breakdown = " · ".join(f"{m} {t:,}" for m, t in usage_summary["by_model"].items())
-                now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                print(f"[{now}] 📊 [Token Usage] thread {run.thread_id[:8]} "
-                      f"총 {usage_summary['total']:,} 토큰 사용 ({breakdown})")
-
             run.status = "done"
             return
     except Exception as e:  # noqa: BLE001 - 백그라운드 스레드 예외를 상태로 노출

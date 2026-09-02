@@ -63,7 +63,6 @@ class tool_span:
         self.context = context
         self.args = None
         self.result = None
-        self.tokens = None
         self._start = None
 
     def __enter__(self):
@@ -79,14 +78,6 @@ class tool_span:
     def set_context(self, context: str) -> None:
         self.context = context
 
-    def set_tokens(self, prompt_tokens, completion_tokens) -> None:
-        """LLM 호출 직후 response.usage에서 뽑은 토큰 수를 기록한다.
-        (KPI 계측용 - 실행 종료 시 pipeline_runner.py가 전체 tool_calls를 훑어 합산한다.)"""
-        self.tokens = {
-            "prompt": prompt_tokens, "completion": completion_tokens,
-            "total": prompt_tokens + completion_tokens,
-        }
-
     def __exit__(self, exc_type, exc, tb):
         end = time.time()
         collector = _current_trace.get()
@@ -101,7 +92,6 @@ class tool_span:
                 "ok": exc_type is None,
                 "args": self.args,
                 "result": self.result,
-                "tokens": self.tokens,
             }
             if exc_type is not None:
                 entry["error"] = f"{exc_type.__name__}: {exc}"
