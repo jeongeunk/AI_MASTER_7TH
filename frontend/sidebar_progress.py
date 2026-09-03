@@ -10,6 +10,7 @@ Tabler 같은 아이콘 폰트 클래스를 쓰면 실제 화면에서 네모(�
 """
 
 import html
+from datetime import datetime
 
 import streamlit as st
 
@@ -42,7 +43,11 @@ def render_sidebar_progress():
         try:
             snapshot = api_client.get_events(thread_id, st.session_state["sidebar_events_since"])
         except Exception:
-            st.caption("진행 상황을 불러오지 못했습니다.")
+            # 폴링(2초 간격) 자체가 실패했다는 뜻 - "마지막 확인 시각"이 여기서 멈춘 채로
+            # 안 늘어나는 것 자체가 "연결이 끊겼다"는 신호가 된다(화면이 죽었는지 폴링이
+            # 죽었는지 구분이 안 되던 문제의 직접적인 해결책).
+            st.caption(f"⚠️ 진행 상황을 불러오지 못했습니다 (마지막 성공: "
+                       f"{st.session_state.get('sidebar_last_ok', '없음')})")
             return
 
         st.session_state["sidebar_events"].extend(snapshot["events"])
@@ -50,12 +55,20 @@ def render_sidebar_progress():
         status = snapshot["status"]
         events = st.session_state["sidebar_events"]
 
+        # 폴링이 방금 성공적으로 한 번 돌았다는 증거 - 새 이벤트가 없어도 이 시각 자체는
+        # run_every=2에 맞춰 2초마다 계속 갱신된다("화면이 안 바뀌어서 죽은 줄 알았다" 문제의
+        # 핵심 해결책: 이 시각이 계속 올라가면 폴링은 살아있는 것, 멈추면 진짜 끊긴 것).
+        now_str = datetime.now().strftime("%H:%M:%S")
+        st.session_state["sidebar_last_ok"] = now_str
+
         seen_steps = [int(ev["plan_step"].split("/")[0]) for ev in events if ev.get("plan_step")]
         max_step = max(seen_steps) if seen_steps else 0
 
         status_label = {"running": "진행 중", "waiting_human": "담당자 확인 대기",
                          "done": "완료", "error": "오류"}.get(status, status)
-        st.markdown(f"**파이프라인 진행** · {status_label}")
+        st.markdown(f"**파이프라인 진행** · {status_label}  \n"
+                    f"<span style='font-size:12px;color:gray;'>🔄 마지막 확인: {now_str}</span>",
+                    unsafe_allow_html=True)
 
         for i, label in STAGE_ORDER:
             if status == "done" or i < max_step:

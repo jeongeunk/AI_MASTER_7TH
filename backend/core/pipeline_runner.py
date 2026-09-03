@@ -168,10 +168,10 @@ _TOOL_DESC_META_SEARCH = {
     "exact_match_meta_db": "동일이름 검색 - 이름이 완전히 똑같은지 찾아보기",
     "request_table_disambiguation": "동일이름 검색 - 같은 이름이 여러 곳에 있으면 사람에게 확인",
     "embed (retrieve_candidates)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
-    "vss_search (column_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
-    "vss_search (glossary_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
-    "vss_search (confirmed_mapping_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
-    "fuzzy_match_candidates": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기",
+    "vss_search (column_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기(임베딩 유사도)",
+    "vss_search (glossary_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기(회사 용어사전 등록 표현인지 검색)",
+    "vss_search (confirmed_mapping_embeddings)": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기(과거 담당자 확인 사례 · Episodic Memory)",
+    "fuzzy_match_candidates": "동일이름 없을 경우 - 뜻이 비슷한 컬럼 찾기(철자 유사도 · 오탈자/표기차이)",
     "generate_match_judgment": "후보 목록 검색 - AI가 후보 중 하나를 골라보기",
     "decide_route": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
     "expand_retrieval_params": "후보 목록 검색 - 확신이 애매하면 검색 범위 넓혀 한 번 더 찾기",
@@ -252,13 +252,16 @@ def _tool_desc(tool_name: str, agent_label: str = None) -> str:
     return tool_name
 
 
-def _print_console_log(node_name: str, agent_label: str, trace: dict | None, summary: str) -> None:
+def _print_console_log(thread_id: str, node_name: str, agent_label: str, trace: dict | None, summary: str) -> None:
     """실측 tool_calls(모델/입력/결정 포함)를 콘솔에 그대로 흘려보낸다.
-    trace가 없으면(instrument_agent로 계측 안 된 노드) 노드 완료 한 줄만 찍는다."""
+    trace가 없으면(instrument_agent로 계측 안 된 노드) 노드 완료 한 줄만 찍는다.
+    thread_id 앞 8자리를 매 줄 앞에 붙인다 - 동시에 여러 파이프라인이 돌면 콘솔에 로그가
+    뒤섞이는데, 이 태그가 없으면 어느 줄이 어느 실행에서 나온 건지 구분할 방법이 없었다."""
+    tid = thread_id[:8]
     tool_calls = trace.get("tool_calls", []) if trace else []
     if not tool_calls:
         now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{now}] 📍 [{agent_label}] {summary}")
+        print(f"[{now}] [{tid}] 📍 [{agent_label}] {summary}")
         return
 
     for tc in tool_calls:
@@ -271,7 +274,7 @@ def _print_console_log(node_name: str, agent_label: str, trace: dict | None, sum
         is_hitl = "HITL" in tc["tool"]
         marker = "🙋" if is_hitl else "🔧"
         ctx_suffix = f" ({tc['context']})" if tc.get("context") else ""
-        print(f"[{ts}] 📍 [{agent_label}] → [{tc['tool']} : {_tool_desc(tc['tool'], agent_label)}]{ctx_suffix}")
+        print(f"[{ts}] [{tid}] 📍 [{agent_label}] → [{tc['tool']} : {_tool_desc(tc['tool'], agent_label)}]{ctx_suffix}")
         print(f"   {marker} Tool: {tc['tool']}  ({tc['duration_sec']}s{'  ok' if tc['ok'] else '  FAILED'})")
         if tc.get("model"):
             print(f"   🤖 Model: {tc['model']}")
@@ -284,7 +287,7 @@ def _print_console_log(node_name: str, agent_label: str, trace: dict | None, sum
 
     hitl_count = sum(1 for tc in tool_calls if "HITL" in tc["tool"] or "confirmation" in tc["tool"])
     now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{now}] 📝 [{agent_label}] 완료 — {summary}"
+    print(f"[{now}] [{tid}] 📝 [{agent_label}] 완료 — {summary}"
           f"{f' (담당자 확인 {hitl_count}회)' if hitl_count else ''}")
 
 
@@ -347,14 +350,14 @@ class PipelineRun:
             })
 
         agent_label = (trace or {}).get("agent") or meta["label"]
-        _print_console_log(node_name, agent_label, trace, summary)
+        _print_console_log(self.thread_id, node_name, agent_label, trace, summary)
 
         # make_log() 고수준 로그 콘솔 출력 - 이모지는 장식일 뿐이고 실제 정보는 항상
         # "[구성요소] 요약" 대괄호 텍스트로 담는다(기존 tool_span 콘솔 로그와 같은 원칙).
         # 콘솔 폰트가 이모지를 못 그려도 대괄호 텍스트는 항상 읽힌다.
         for log in agent_logs:
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{ts}] {format_log_for_display(log)}")
+            print(f"[{ts}] [{self.thread_id[:8]}] {format_log_for_display(log)}")
 
     def push_plan_announcement(self):
         now = time.time()
@@ -457,7 +460,7 @@ def _run_stream(run: PipelineRun, graph_app, config: dict):
             if usage_summary["total"]:
                 breakdown = " · ".join(f"{m} {t:,}" for m, t in usage_summary["by_model"].items())
                 now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                print(f"[{now}] 📊 [Token Usage] thread {run.thread_id[:8]} "
+                print(f"[{now}] [{run.thread_id[:8]}] 📊 [Token Usage] "
                       f"총 {usage_summary['total']:,} 토큰 사용 ({breakdown})")
 
             run.status = "done"

@@ -25,6 +25,7 @@ import sys
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from typing import Literal, Optional
 
 import duckdb
@@ -51,6 +52,15 @@ SIMILARITY_PREFILTER_FLOOR = 0.75   # retrieve_candidates 1차 후보 필터 cos
 HIGH_CONFIDENCE_SKIP_RETRY = 0.92   # 이 이상이면 재검색 없이 바로 담당자 확인
 RETRY_CONFIDENCE_FLOOR = 0.70       # 이 미만이면 재검색 없이 바로 담당자 확인
 MAX_RETRIEVAL_ATTEMPTS = 2          # 재검색 최대 횟수
+
+# Episodic Memory(confirmed_mapping_examples) 캐시 만료 기준(일) - LRU 방식.
+# 적재 시점(confirmed_at)이 아니라 "마지막으로 검색에 잡혀 실제로 쓰인 시점"
+# (last_accessed_at)을 기준으로 삼는다 - 자주 재등장하는 컬럼은 계속 살아있고,
+# 한 번 쓰이고 다시 안 나오는 컬럼만 자연스럽게 만료되게 하기 위함. 이전까지는
+# TTL 자체가 없어 무기한 누적됐다(실 DB 스키마가 바뀌어도 캐시가 stale한 채로
+# 계속 후보로 잡히는 위험 - 상세 설계 문서 5.4절 참고). 사용자가 .env에서
+# 직접 조정 가능(향후 세팅 화면 제공 전까지는 이 환경변수가 유일한 조정 지점).
+EPISODIC_MEMORY_TTL_DAYS = int(os.environ.get("EPISODIC_MEMORY_TTL_DAYS", "180"))
 
 
 # ── Tool: exact_match_meta_db ──────────────────────────────
@@ -154,7 +164,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
             """,
             [query_vec, max(top_k * 2, 5)],
         ).fetchall()
-        span.set_result(f"후보 {len(col_rows)}건")
+        span.set_result(f"의미 유사 후보 {len(col_rows)}건 (임베딩)")
     for r in col_rows:
         similarity = 1 - r[5]
         meta_row = {"column_id": r[0], "table_id": r[1], "column_name": r[2], "data_type": r[3], "description": r[4]}
@@ -177,7 +187,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                 """,
                 [query_vec, max(top_k * 2, 5)],
             ).fetchall()
-            span.set_result(f"후보 {len(gloss_rows)}건")
+            span.set_result(f"용어사전 매칭 후보 {len(gloss_rows)}건")
         for r in gloss_rows:
             similarity = 1 - r[2]
             if similarity < glossary_floor:
@@ -197,23 +207,28 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
     # 3) 과거 확정 매핑 사례(Episodic Memory) — validated(정확 매칭/담당자 승인)만 누적되어 있음.
     #    auto_confirmed는 사람이 검증한 적이 없어 여기 포함되지 않는다(persist_confirmed_mapping_example 참고).
     #    사람이 이미 검증한 사례라 컬럼 설명 임베딩과 동일한 floor로 취급한다(glossary처럼 낮춰주지 않음).
+    #    LRU TTL: last_accessed_at이 EPISODIC_MEMORY_TTL_DAYS보다 오래된 항목은 후보에서 제외하고,
+    #    후보로 채택된 항목은 last_accessed_at을 지금 시각으로 갱신한다(자주 재등장하는 컬럼은
+    #    계속 살아있고, 한 번 쓰이고 다시 안 나오는 컬럼만 자연스럽게 만료됨).
     try:
+        ttl_cutoff = datetime.now() - timedelta(days=EPISODIC_MEMORY_TTL_DAYS)
         with tool_span("vss_search (confirmed_mapping_embeddings)", context=context) as span:
-            span.set_args({"top_k": top_k})
+            span.set_args({"top_k": top_k, "ttl_days": EPISODIC_MEMORY_TTL_DAYS})
             conf_rows = con.execute(
                 """
-                SELECT cme.column_id,
+                SELECT cme.column_id, cme.example_id,
                        array_cosine_distance(cmeb.embedding, ?::FLOAT[3072]) AS distance
                 FROM confirmed_mapping_embeddings cmeb
                 JOIN confirmed_mapping_examples cme ON cmeb.example_id = cme.example_id
+                WHERE cme.last_accessed_at >= ?
                 ORDER BY distance ASC
                 LIMIT ?
                 """,
-                [query_vec, max(top_k * 2, 5)],
+                [query_vec, ttl_cutoff, max(top_k * 2, 5)],
             ).fetchall()
-            span.set_result(f"후보 {len(conf_rows)}건")
+            span.set_result(f"과거 확인 사례 후보 {len(conf_rows)}건 (Episodic Memory, TTL {EPISODIC_MEMORY_TTL_DAYS}일 이내)")
         for r in conf_rows:
-            similarity = 1 - r[1]
+            similarity = 1 - r[2]
             if similarity < floor:
                 continue
             meta_row_q = con.execute(
@@ -224,6 +239,11 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
                 meta_row = {"column_id": meta_row_q[0], "table_id": meta_row_q[1], "column_name": meta_row_q[2],
                             "data_type": meta_row_q[3], "description": meta_row_q[4]}
                 _consider(r[0], similarity, "confirmed_mapping", meta_row)
+                # LRU 갱신 - 실제로 후보로 채택된(floor를 통과한) 항목만 "다시 쓰였다"고 인정한다.
+                con.execute(
+                    "UPDATE confirmed_mapping_examples SET last_accessed_at = current_timestamp WHERE example_id = ?",
+                    [r[1]],
+                )
     except duckdb.Error:
         # confirmed_mapping_embeddings가 아직 생성되지 않은 초기 환경(첫 실행)에서도 죽지 않도록 방어
         pass
@@ -233,7 +253,7 @@ def retrieve_candidates(con, eng_name: str, description: str, embed_fn,
         span.set_args({"eng_name": eng_name})
         all_columns = _fetch_all_columns(con)
         fuzzy_results = fuzzy_match_candidates(eng_name, all_columns, top_k=top_k)
-        span.set_result(f"후보 {len(fuzzy_results)}건")
+        span.set_result(f"철자 유사 후보 {len(fuzzy_results)}건 (오탈자·표기차이)")
     for fm in fuzzy_results:
         cid = fm["column_id"]
         if cid in merged:
@@ -596,7 +616,8 @@ def _ensure_confirmed_mapping_tables(con):
             description VARCHAR,
             column_id VARCHAR,
             confirmation_source VARCHAR,
-            confirmed_at TIMESTAMP DEFAULT current_timestamp
+            confirmed_at TIMESTAMP DEFAULT current_timestamp,
+            last_accessed_at TIMESTAMP DEFAULT current_timestamp
         )
     """)
     con.execute("""
@@ -605,6 +626,17 @@ def _ensure_confirmed_mapping_tables(con):
             embedding FLOAT[3072]
         )
     """)
+    # last_accessed_at(LRU 갱신용)은 나중에 추가된 컬럼이라, 이미 만들어진(구버전 스키마)
+    # 메타 DB에는 CREATE TABLE IF NOT EXISTS로 새로 안 생긴다 - final_tag 때(metrics_store.py)와
+    # 동일한 패턴으로 있는지 확인 후 없으면 ALTER TABLE로 보강한다.
+    existing_cols = {row[1] for row in con.execute("PRAGMA table_info('confirmed_mapping_examples')").fetchall()}
+    if "last_accessed_at" not in existing_cols:
+        con.execute(
+            "ALTER TABLE confirmed_mapping_examples ADD COLUMN last_accessed_at TIMESTAMP DEFAULT current_timestamp"
+        )
+        # 기존 행들은 이 컬럼이 생기기 전까지 접근 이력이 없었으므로, 적재 시점(confirmed_at)을
+        # 최초 last_accessed_at으로 채워 넣어 곧바로 만료 판정 대상이 되지 않게 한다.
+        con.execute("UPDATE confirmed_mapping_examples SET last_accessed_at = confirmed_at WHERE last_accessed_at IS NULL")
 
 
 # resolution_path == "validated"로 확정된 match_status만 대상 - auto_confirmed는 사람이 검증한 적이
