@@ -9,6 +9,7 @@ Classification Agent
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,12 +49,32 @@ def tag_from_type_status(type_match_status: str, context: str = None) -> dict:
 
 
 # ── Tool: compare_period ────────────────────────────────────
+# 명세서 "시점(기간)" 칸은 담당자마다 표기가 제각각이다(실측: '202406~202412'뿐 아니라
+# '2025.01~2025.12'처럼 연/월 사이에 점을 넣는 표기도 등장 - int() 직변환 시
+# "invalid literal for int() with base 10: '2025.01'"로 파이프라인이 죽던 원인).
+# 연 4자리 + 구분자(.,-,/ 또는 없음) + 월 1~2자리 형태는 전부 YYYYMM 정수로 정규화한다.
+_PERIOD_PART_RE = re.compile(r"^(\d{4})[.\-/]?(\d{1,2})$")
+
+
+def _parse_period_part(part: str) -> int | None:
+    m = _PERIOD_PART_RE.match(part)
+    if not m:
+        return None
+    year, month = m.group(1), m.group(2).zfill(2)
+    return int(year + month)
+
+
 def _parse_period(period_str: str):
-    """'202406~202412' -> (202406, 202412)"""
+    """'202406~202412' 또는 '2025.01~2025.12' 등 표기가 달라도 (202406, 202412)처럼
+    YYYYMM 정수 쌍으로 정규화. 표준 형식(YYYY[.-/]?MM~YYYY[.-/]?MM)을 벗어나면 예외를
+    던지는 대신 (None, None)을 반환해 "요청기간 미기재"와 동일하게 안전 처리한다."""
     parts = str(period_str).replace(" ", "").split("~")
     if len(parts) != 2:
         return None, None
-    return int(parts[0]), int(parts[1])
+    start, end = _parse_period_part(parts[0]), _parse_period_part(parts[1])
+    if start is None or end is None:
+        return None, None
+    return start, end
 
 
 def intersect_periods(periods: list, context: str = None) -> tuple:
