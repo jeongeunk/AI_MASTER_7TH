@@ -56,17 +56,25 @@ AI_PROJECT/
 │   ├── classification_agent.py  # 최종 6종 태그 확정 (결정론적 규칙)
 │   ├── report_agent.py          # 결과 취합 + 엑셀 산출물 생성
 │   ├── langgraph_pipeline.py    # 6개 Agent를 묶는 StateGraph 정의
-│   └── trace.py                 # Agent/tool 실행 트레이싱 (모니터링 화면용)
+│   ├── prompt_guard.py          # 프롬프트 인젝션 문구 패턴 사전 스캔 (구조적 방어는 각 Agent 시스템 프롬프트)
+│   └── trace.py                 # Agent/tool 실행 트레이싱 + 토큰 사용량 계측 (모니터링·KPI 화면용)
 ├── backend/                 # FastAPI (LangGraph를 백그라운드 스레드로 실행 + HITL 폴링 API)
 │   ├── main.py                   # uvicorn backend.main:app --reload --port 8000
-│   ├── api/{specs,pipeline}.py
-│   └── core/pipeline_runner.py
-├── frontend/                 # Streamlit 웹 UI
+│   ├── api/{specs,pipeline,kpi}.py       # kpi.py: KPI 리포트 집계 API
+│   └── core/{pipeline_runner,metrics_store}.py  # metrics_store: 실행 단위 계측 + KPI 기준 시점(baseline)
+├── frontend/                 # Streamlit 웹 UI (화면 5개)
 │   ├── app.py                    # streamlit run frontend/app.py (업로드 + 진행 상황)
 │   ├── pages/2_모니터링.py        # Agent별 실행 로그 + HITL 확인 카드
 │   ├── pages/3_결과_및_다운로드.py
+│   ├── pages/4_KPI_리포트.py       # KPI 4종 집계 (기준 시점 이후 / 전체 이력)
+│   ├── pages/5_에이전트_트레이스.py # 7대 구성요소(계획·실행·판단·기억·사람개입·자기교정·오류) 관점 실행 타임라인
 │   ├── sidebar_progress.py
 │   └── api_client.py
+├── evaluation/              # KPI 집계·검증 (CLI, 재실행 없이 실행 이력 SQL 집계)
+│   ├── run_metrics_kpi_report.py       # 실행 이력 → KPI 4종 리포트
+│   ├── run_reproducibility_check.py    # 판정 재현성 (동일 명세서 N회)
+│   ├── run_retrieval_attempts_check.py # 재검색 횟수 추이
+│   └── run_threshold_sweep.py          # 라우팅 임계값 스윕
 ├── scripts/
 │   ├── load_data_db.py                  # xlsx → 실데이터 DB 적재
 │   ├── test_setup.py                    # DuckDB + vss 설치/검증
@@ -79,7 +87,13 @@ AI_PROJECT/
 │   │                                       # 용어집(glossary) 구축 (선택)
 │   ├── init_audit_db.py                 # 감사 DB(SQLite) 초기화
 │   ├── verify_meta_db.py                # 메타 DB 최종 검증
-│   └── build_*_spec.py / verify_*.py    # 테스트 명세서 생성·검증 스크립트 (아래 참고)
+│   ├── build_*_spec.py / verify_*.py    # Agent 분기 재현용 테스트 명세서 생성·검증 (아래 "테스트 명세서" 참고)
+│   ├── generate_kpi_test_specs.py / generate_diversity_and_scale_specs.py
+│   │   / generate_type_mismatch_spec.py / generate_kpi4_retry_reduction_spec.py
+│   │                                       # KPI·정확도 실측용 명세서 생성 (아래 "KPI 측정" 참고)
+│   ├── measure_match_error_rates.py     # 매칭 정확도 FP/FN(오매칭·놓침) 정량 집계
+│   ├── analyze_prompt_injection.py      # 프롬프트 인젝션·인코딩 우회 침투 분석
+│   └── measure_kpi4_*.py / dryrun_kpi4_*.py  # KPI4(재검색 감소) 측정·사전검증
 ├── data/
 │   ├── (원본 데이터 xlsx 6개: dim_customer, fact_*)
 │   └── (테스트 명세서는 build_*.py로 생성 - 아래 "테스트 명세서" 참고)
@@ -174,6 +188,28 @@ python scripts\build_join_missing_key_spec.py                # data\join_missing
 | `join_missing_key_spec.xlsx` | Join Resolution: 조인에 필요한 키가 요청 목록에 없을 때의 알림+담당자 확인+자동 추가 |
 
 각 파일은 `scripts\verify_*.py`로 콘솔 입력 없이(자동 승인) 끝까지 돌려 의도한 분기를 타는지 먼저 검증할 수 있고, 실제 담당자 확인 카드를 눈으로 보려면 웹 앱에 업로드하면 됩니다.
+
+## KPI 측정 및 정확도 실측
+
+파이프라인 실행마다 항목별 판정 결과와 모델별 토큰 사용량이 감사 DB에 적재됩니다. 이를 **재실행 없이 SQL로 집계**해 KPI를 산출합니다.
+
+```powershell
+python evaluation\run_metrics_kpi_report.py            # 기준 시점 이후만 집계
+python evaluation\run_metrics_kpi_report.py --all      # 전체 이력
+```
+
+- **KPI 4종**: 검증 소요 시간 / 자동 판별 커버리지 / 판정 재현성 / 컬럼 재등장 시 내부 재검색 감소
+- **기준 시점(baseline)**: 초기 실험분과 고도화 이후 실행분을 섞지 않도록 감사 DB의 `kpi_baseline`에 "여기서부터 새 라운드" 시점만 기록(데이터는 삭제하지 않음). 웹 KPI 리포트 화면과 CLI 모두 이 시점 이후만 집계하고, "전체 이력" 옵션으로 언제든 전체 확인 가능.
+
+### 정확도·안전성 실측 스크립트
+
+`data/`·`db/`는 git 제외 대상이라 명세서를 생성한 뒤 **운영 DB의 스냅샷 사본**에서 측정합니다(운영·감사 DB 오염 방지 — 경로에 안전 표식 강제).
+
+| 스크립트 | 측정 대상 |
+|---|---|
+| `measure_match_error_rates.py` | 매칭 정확도 — 정답을 미리 지정한 명세서 3종(패러프레이즈 27 / 대규모 50 / 타입 불일치 12)을 담당자 확인 자동 승인으로 태워 정탐·오매칭(FP)·놓침(FN)으로 분류 |
+| `analyze_prompt_injection.py` | 프롬프트 인젝션 방어 — 인코딩 우회 6종(제로폭·전각·Base64·동형이의·문자 간격·한글 자간) 등에서 우회 문구 포함/제거 응답을 비교, 판단 AI의 역할 이탈 여부와 다운스트림 가드 구조를 확인 |
+| `measure_kpi4_isolated.py` / `measure_kpi4_via_api_groundtruth.py` | KPI4 — "재검색이 실제로 걸리는 컬럼"만 골라 N회 반복해 재등장 시 내부 재검색 루프 감소율 측정 |
 
 ## 알려진 제약사항
 
