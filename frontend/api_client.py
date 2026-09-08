@@ -67,8 +67,12 @@ class APIClient:
         r.raise_for_status()
         return r.content
 
-    def get_kpi_report(self, eng_name: str = None) -> dict:
-        params = {"eng_name": eng_name} if eng_name else {}
+    def get_kpi_report(self, eng_name: str = None, all: bool = False) -> dict:
+        params = {}
+        if eng_name:
+            params["eng_name"] = eng_name
+        if all:
+            params["all"] = "true"
         r = requests.get(f"{BACKEND_URL}/api/kpi/report", params=params, timeout=30)
         r.raise_for_status()
         return r.json()

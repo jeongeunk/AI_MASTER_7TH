@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from backend.core.metrics_store import get_kpi_baseline
 from evaluation.run_metrics_kpi_report import (
     compute_coverage,
     compute_processing_time,
@@ -43,6 +44,7 @@ router = APIRouter()
 class KpiReportResponse(BaseModel):
     available: bool
     message: Optional[str] = None
+    baseline_marked_at: Optional[float] = None
     processing_time: Optional[dict] = None
     coverage: Optional[dict] = None
     reproducibility: Optional[dict] = None
@@ -50,7 +52,12 @@ class KpiReportResponse(BaseModel):
 
 
 @router.get("/kpi/report", response_model=KpiReportResponse)
-def get_kpi_report(eng_name: str = None):
+def get_kpi_report(eng_name: str = None, all: bool = False):
+    """기준 시점(kpi_baseline)이 기록돼 있으면 그 이후 run_metrics만 집계한다 -
+    기존 이력은 지우지 않고 "여기서부터 새 테스트 라운드"만 화면에 반영하고 싶을 때 쓰는
+    방식(evaluation/run_metrics_kpi_report.py의 set_kpi_baseline 참고). all=true를 넘기면
+    기준 시점을 무시하고 전체 이력을 집계한다."""
+    baseline = None if all else get_kpi_baseline()
     con = get_connection()
     try:
         if not run_metrics_table_exists(con):
@@ -59,19 +66,25 @@ def get_kpi_report(eng_name: str = None):
                 "message": "run_metrics 테이블이 아직 없습니다. 웹에서 명세서를 최소 1회 이상 실행한 뒤 다시 확인하세요.",
             }
 
-        all_rows = fetch_rows(con)  # KPI1·2(실행 단위)는 항상 전체 데이터 기준
+        all_rows = fetch_rows(con, since=baseline)  # KPI1·2(실행 단위)는 항상 전체 데이터 기준(eng_name 필터 없음)
         if not all_rows:
             return {
                 "available": False,
-                "message": "run_metrics에 기록된 데이터가 없습니다.",
+                "baseline_marked_at": baseline,
+                "message": (
+                    "기준 시점 이후 기록된 데이터가 없습니다. 새 테스트를 실행하거나, "
+                    "all=true로 전체 이력을 조회하세요."
+                    if baseline else "run_metrics에 기록된 데이터가 없습니다."
+                ),
             }
 
         thread_grouped = group_by_thread_id(all_rows)
-        rows_for_column_kpi = fetch_rows(con, eng_name) if eng_name else all_rows
+        rows_for_column_kpi = fetch_rows(con, eng_name, since=baseline) if eng_name else all_rows
         grouped = group_by_eng_name(rows_for_column_kpi)
 
         return {
             "available": True,
+            "baseline_marked_at": baseline,
             "processing_time": compute_processing_time(thread_grouped),
             "coverage": compute_coverage(thread_grouped),
             "reproducibility": compute_reproducibility(grouped),

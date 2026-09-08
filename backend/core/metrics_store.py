@@ -18,6 +18,7 @@ run_metrics 테이블 하나로 아래 4개 KPI를 SQL 집계로 뽑아낼 수 �
 
 import os
 import sqlite3
+import time
 
 AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
@@ -134,6 +135,59 @@ def log_token_usage(thread_id: str, input_file: str, calls: list) -> None:
                 [thread_id, input_file, call.get("model"),
                  tokens.get("prompt"), tokens.get("completion"), tokens.get("total")],
             )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _ensure_kpi_baseline_table(con):
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS kpi_baseline (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            marked_at REAL NOT NULL
+        )
+    """)
+
+
+def set_kpi_baseline(marked_at: float = None) -> float:
+    """화면의 KPI 리포트가 이 시점 이후 run_metrics만 집계하도록 기준 시각을 기록한다.
+    기존 이력(run_metrics)은 그대로 두고, "여기서부터가 새 테스트 라운드"라는 표시만
+    남기는 방식 - 데이터를 지우지 않아 되돌리기 쉽다. marked_at을 안 넘기면 지금 이
+    순간(time.time())을 기준으로 삼는다. 행 1개(id=1)만 유지 - 다시 호출하면 기준
+    시점이 그 값으로 교체된다(이전 기준은 남지 않음)."""
+    marked_at = marked_at if marked_at is not None else time.time()
+    con = sqlite3.connect(AUDIT_DB_PATH)
+    _ensure_kpi_baseline_table(con)
+    try:
+        con.execute(
+            "INSERT INTO kpi_baseline (id, marked_at) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET marked_at = excluded.marked_at",
+            [marked_at],
+        )
+        con.commit()
+    finally:
+        con.close()
+    return marked_at
+
+
+def get_kpi_baseline() -> float:
+    """기록된 기준 시점(epoch)을 반환. 아직 한 번도 기록한 적 없으면 None -
+    이 경우 KPI 리포트는 기존처럼 전체 이력을 집계한다(하위 호환)."""
+    con = sqlite3.connect(AUDIT_DB_PATH)
+    _ensure_kpi_baseline_table(con)
+    try:
+        row = con.execute("SELECT marked_at FROM kpi_baseline WHERE id = 1").fetchone()
+    finally:
+        con.close()
+    return row[0] if row else None
+
+
+def clear_kpi_baseline() -> None:
+    """기준 시점을 해제한다 - 이후 KPI 리포트는 다시 전체 이력을 집계한다."""
+    con = sqlite3.connect(AUDIT_DB_PATH)
+    _ensure_kpi_baseline_table(con)
+    try:
+        con.execute("DELETE FROM kpi_baseline WHERE id = 1")
         con.commit()
     finally:
         con.close()

@@ -15,6 +15,8 @@ evaluation/run_metrics_kpi_report.py의 CLI와 집계 기준이 동일하다
 재등장 이력이 없어 측정 대상 자체가 0건).
 """
 
+from datetime import datetime
+
 import streamlit as st
 
 from api_client import api_client
@@ -25,11 +27,22 @@ render_sidebar_progress()
 st.title("4. KPI 리포트")
 st.caption("웹으로 여러 번 업로드된 실행 이력(run_metrics)을 재실행 없이 그대로 집계한 결과입니다.")
 
+show_all_history = st.checkbox(
+    "기준 시점 무시하고 전체 이력 보기",
+    value=False,
+    help="기준 시점이 기록돼 있으면 평소엔 그 이후 데이터만 집계합니다. "
+         "체크하면 기준 시점 이전 이력까지 전부 포함해서 봅니다.",
+)
+
 try:
-    report = api_client.get_kpi_report()  # KPI1·2는 항상 전체 데이터 기준(필터 없음)
+    report = api_client.get_kpi_report(all=show_all_history)  # KPI1·2는 항상 전체 데이터 기준(컬럼 필터 없음)
 except Exception as e:
     st.error(f"KPI 리포트 조회 실패: {e}")
     st.stop()
+
+if report.get("baseline_marked_at") and not show_all_history:
+    marked_str = datetime.fromtimestamp(report["baseline_marked_at"]).strftime("%Y-%m-%d %H:%M:%S")
+    st.caption(f"🕒 기준 시점: **{marked_str}** 이후 데이터만 집계 중입니다(이전 이력은 지워지지 않고 그대로 있습니다).")
 
 if not report["available"]:
     st.info(report["message"])
@@ -91,7 +104,7 @@ eng_name_filter = st.text_input("컬럼(영문명) 필터 - 비워두면 전체 
 
 if eng_name_filter:
     try:
-        report = api_client.get_kpi_report(eng_name_filter)
+        report = api_client.get_kpi_report(eng_name_filter, all=show_all_history)
     except Exception as e:
         st.error(f"KPI 리포트 조회 실패: {e}")
         st.stop()

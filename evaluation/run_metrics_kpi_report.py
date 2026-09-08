@@ -47,7 +47,12 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.core.metrics_store import _ensure_run_metrics_table
+from backend.core.metrics_store import (
+    _ensure_run_metrics_table,
+    clear_kpi_baseline,
+    get_kpi_baseline,
+    set_kpi_baseline,
+)
 
 AUDIT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "./db/schemascout_audit.sqlite")
 
@@ -69,19 +74,28 @@ def run_metrics_table_exists(con) -> bool:
     return True
 
 
-def fetch_rows(con, eng_name: str = None):
+def fetch_rows(con, eng_name: str = None, since: float = None):
     """eng_name을 넘기면 그 컬럼만 필터링한다 - KPI3·4(컬럼 단위)에서만 의미가 있고,
     KPI1·2(실행 단위)는 항상 eng_name=None(전체)으로 호출해야 한다(특정 컬럼만 걸러내면
-    실행의 분모/처리시간이 왜곡된다)."""
+    실행의 분모/처리시간이 왜곡된다).
+
+    since(기준 시점, epoch)를 넘기면 run_started_at이 그 시점 이후인 실행만 집계한다 -
+    기존 run_metrics 이력은 지우지 않은 채 "이 시점부터가 새 테스트 라운드"라고 표시만
+    해두고 화면/CLI 양쪽에서 그 이후 데이터만 보고 싶을 때 쓴다(set_kpi_baseline 참고)."""
     query = (
         "SELECT eng_name, thread_id, column_id, match_status, retrieval_attempts, "
         "run_started_at, run_completed_at, final_tag, input_file "
         "FROM run_metrics"
     )
-    params = []
+    clauses, params = [], []
     if eng_name:
-        query += " WHERE eng_name = ?"
+        clauses.append("eng_name = ?")
         params.append(eng_name)
+    if since is not None:
+        clauses.append("run_started_at >= ?")
+        params.append(since)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY eng_name, run_started_at"
     return con.execute(query, params).fetchall()
 
@@ -315,17 +329,42 @@ def report_retrieval_attempts(grouped: dict) -> None:
 
 
 def main():
+    import datetime
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--eng-name", default=None, help="특정 컬럼(영문명)만 집계(KPI3·4에만 적용)")
+    parser.add_argument("--set-baseline", action="store_true",
+                         help="지금 시각을 KPI 집계 기준 시점으로 기록하고 종료(집계는 하지 않음) - "
+                              "기존 run_metrics 이력은 지우지 않고, 이후 CLI/화면 모두 이 시점 "
+                              "이후 데이터만 집계하게 됨")
+    parser.add_argument("--clear-baseline", action="store_true",
+                         help="기준 시점을 해제하고 종료 - 이후 다시 전체 이력을 집계함")
+    parser.add_argument("--all", action="store_true",
+                         help="기준 시점이 설정돼 있어도 무시하고 전체 이력을 집계")
     args = parser.parse_args()
+
+    if args.set_baseline:
+        marked_at = set_kpi_baseline()
+        dt = datetime.datetime.fromtimestamp(marked_at).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"KPI 집계 기준 시점을 지금({dt})으로 기록했습니다. 이후 집계는 이 시점 이후 데이터만 포함합니다.")
+        return
+    if args.clear_baseline:
+        clear_kpi_baseline()
+        print("KPI 집계 기준 시점을 해제했습니다. 이후 집계는 다시 전체 이력을 포함합니다.")
+        return
 
     con = get_connection()
     if not run_metrics_table_exists(con):
         print("run_metrics 테이블이 아직 없습니다 - 웹 백엔드로 명세서를 최소 1회 이상 실행한 뒤 다시 시도하세요.")
         return
 
-    # KPI1·2(실행 단위)는 항상 전체 데이터 기준 - eng_name 필터를 적용하면 안 됨
-    all_rows = fetch_rows(con)
+    baseline = None if args.all else get_kpi_baseline()
+    if baseline is not None:
+        dt = datetime.datetime.fromtimestamp(baseline).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"※ 기준 시점({dt}) 이후 데이터만 집계합니다. 전체 이력을 보려면 --all 옵션을 쓰세요.")
+
+    # KPI1·2(실행 단위)는 항상 전체 데이터 기준 - eng_name 필터를 적용하면 안 됨(단, since는 적용)
+    all_rows = fetch_rows(con, since=baseline)
     if not all_rows:
         print("run_metrics에 기록된 데이터가 없습니다.")
         return
@@ -334,7 +373,7 @@ def main():
     report_coverage(thread_grouped)
 
     # KPI3·4(컬럼 단위)는 --eng-name 필터 적용 가능
-    rows = fetch_rows(con, args.eng_name) if args.eng_name else all_rows
+    rows = fetch_rows(con, args.eng_name, since=baseline) if args.eng_name else all_rows
     grouped = group_by_eng_name(rows)
     report_reproducibility(grouped)
     report_retrieval_attempts(grouped)
