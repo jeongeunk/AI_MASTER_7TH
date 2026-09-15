@@ -252,16 +252,28 @@ def _tool_desc(tool_name: str, agent_label: str = None) -> str:
     return tool_name
 
 
+_seen_agents_by_thread: dict[str, set] = {}
+
+
 def _print_console_log(thread_id: str, node_name: str, agent_label: str, trace: dict | None, summary: str) -> None:
     """실측 tool_calls(모델/입력/결정 포함)를 콘솔에 그대로 흘려보낸다.
     trace가 없으면(instrument_agent로 계측 안 된 노드) 노드 완료 한 줄만 찍는다.
     thread_id 앞 8자리를 매 줄 앞에 붙인다 - 동시에 여러 파이프라인이 돌면 콘솔에 로그가
-    뒤섞이는데, 이 태그가 없으면 어느 줄이 어느 실행에서 나온 건지 구분할 방법이 없었다."""
+    뒤섞이는데, 이 태그가 없으면 어느 줄이 어느 실행에서 나온 건지 구분할 방법이 없었다.
+    같은 thread_id 안에서 어떤 Agent가 처음 등장할 때만(재등장 시에는 생략) 구분선을
+    한 번 찍고, tool_call 한 건이 끝날 때마다(다음 tool_call이든 완료 요약 줄이든) 빈 줄을
+    넣어 타임스탬프 줄 하나하나가 뭉쳐 보이지 않게 한다."""
     tid = thread_id[:8]
+    seen = _seen_agents_by_thread.setdefault(thread_id, set())
+    if agent_label not in seen:
+        print("=" * 64)
+        seen.add(agent_label)
+
     tool_calls = trace.get("tool_calls", []) if trace else []
     if not tool_calls:
         now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{now}] [{tid}] 📍 [{agent_label}] {summary}")
+        print()
         return
 
     for tc in tool_calls:
@@ -284,11 +296,13 @@ def _print_console_log(thread_id: str, node_name: str, agent_label: str, trace: 
             print(f"   💬 {tc['result']}")
         if not tc.get("ok") and tc.get("error"):
             print(f"   ❌ Error: {tc['error']}")
+        print()
 
     hitl_count = sum(1 for tc in tool_calls if "HITL" in tc["tool"] or "confirmation" in tc["tool"])
     now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{now}] [{tid}] 📝 [{agent_label}] 완료 — {summary}"
           f"{f' (담당자 확인 {hitl_count}회)' if hitl_count else ''}")
+    print()
 
 
 class PipelineRun:
@@ -358,6 +372,7 @@ class PipelineRun:
         for log in agent_logs:
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             print(f"[{ts}] [{self.thread_id[:8]}] {format_log_for_display(log)}")
+            print()
 
     def push_plan_announcement(self):
         now = time.time()

@@ -42,8 +42,8 @@ with center_col:
         """
         <div style="text-align:center;margin-bottom:20px;">
             <div style="font-size:34px;margin-bottom:6px;">🔍</div>
-            <p style="font-size:22px;font-weight:600;margin:0 0 4px;">SchemaScout</p>
-            <p style="font-size:13px;color:gray;margin:0;">데이터 명세서 자동 검증 파이프라인</p>
+            <p style="font-size:40px;font-weight:600;margin:0 0 4px;">SchemaScout</p>
+            <p style="font-size:25px;color:gray;margin:0;">데이터 명세서 자동 검증 파이프라인</p>
         </div>
         """,
         unsafe_allow_html=True,
